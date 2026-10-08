@@ -82,7 +82,7 @@ test('path guard rejects protected paths case-insensitively and accepts normal f
     '.github/workflows/ci.yml', '.GitHub/workflows/x.yml',
     'nested/.github/evil.yml', 'infra/secret', 'deploy/run.sh',
     'tools/autopilot/preflight.mjs', '.claude/settings.json',
-    'src/AGENTS.md', 'CLAUDE.md', '.mcp.json',
+    'src/AGENTS.md', 'CLAUDE.md', '.mcp.json', '.env', '.env.production', 'src/.env', 'src/.npmrc',
     '.gitmodules', '.gitattributes', 'private.pem'
   ]) {
     assert.equal(testCase(normalizeAndCase, 'path', blocked), false, blocked);
