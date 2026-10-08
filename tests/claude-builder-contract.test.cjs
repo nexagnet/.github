@@ -19,7 +19,7 @@ const jobs = data.jobs;
 const preflight = jobs.preflight.steps.find(s => s.id === 'gate').run;
 const agent = jobs.agent;
 const publish = jobs.publish;
-const validator = publish.steps.find(s => s.name.startsWith('Validate patch')).run;
+const validator = publish.steps.find(s => s.name?.startsWith('Validate patch')).run;
 
 test('reusable workflow, restricted author and pinned dependencies', () => {
   assert.ok(caller);
@@ -39,7 +39,7 @@ test('AI job has no GitHub write permission, OIDC or publisher credential', () =
   assert.equal(agent.permissions['pull-requests'], 'read');
   assert.equal(agent.permissions['id-token'], undefined);
   assert.ok(!JSON.stringify(agent).includes('BUILDER_PUBLISHER_APP_PRIVATE_KEY'));
-  const step = agent.steps.find(s => s.name.startsWith('Claude proposes'));
+  const step = agent.steps.find(s => s.name?.startsWith('Claude proposes'));
   assert.equal(step.with.github_token, '\${{ github.token }}');
   assert.match(step.with.claude_args, /--disallowedTools "Bash,WebFetch,WebSearch"/);
 });
@@ -47,7 +47,7 @@ test('AI job has no GitHub write permission, OIDC or publisher credential', () =
 test('privileged publisher is strictly downstream from validation', () => {
   assert.deepEqual(publish.needs, ['preflight', 'agent']);
   assert.equal(publish.permissions.contents, 'read');
-  const validatorIdx = publish.steps.findIndex(s => s.name.startsWith('Validate patch'));
+  const validatorIdx = publish.steps.findIndex(s => s.name?.startsWith('Validate patch'));
   const tokenIdx = publish.steps.findIndex(s => s.id === 'publisher');
   assert.ok(validatorIdx >= 0 && tokenIdx > validatorIdx);
   assert.equal(publish.steps[tokenIdx].with['permission-contents'], 'write');
