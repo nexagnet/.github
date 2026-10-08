@@ -193,8 +193,8 @@ jobs:
             case "$p" in
               .github/*|*/.github/*|infra/*|deploy/*|tools/autopilot/*|\
               .claude/*|*/.claude/*|.git/*|.gitmodules|.gitattributes|\
-              .mcp.json|.npmrc|*.pem|*.key|agents.md|*/agents.md|\
-              claude.md|*/claude.md)
+              .mcp.json|.npmrc|*/.npmrc|.env|.env.*|*/.env|*/.env.*|\
+              *.pem|*.key|agents.md|*/agents.md|claude.md|*/claude.md)
                 echo "::error::Forbidden path: $path"; exit 1 ;;
             esac
             mode="$(git ls-files --stage -- "$path" | awk 'NR==1 {print $1}')"
