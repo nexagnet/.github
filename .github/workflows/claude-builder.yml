@@ -1,0 +1,95 @@
+
+name: Nexagnet Reusable Claude Builder
+
+on:
+  workflow_call:
+    inputs:
+      issue_number:
+        description: Issue number in the calling repository
+        required: true
+        type: number
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+
+permissions: {}
+
+jobs:
+  preflight:
+    name: Validate Task Contract
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - name: Validate caller and Issue
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TASK_ISSUE: ${{ inputs.issue_number }}
+        run: |
+          set -euo pipefail
+
+          [[ "$GITHUB_REPOSITORY_OWNER" == "nexagnet" ]] || exit 1
+          [[ "$GITHUB_EVENT_NAME" == "issue_comment" ]] || exit 1
+          [[ "$GITHUB_ACTOR" == "phungtienviet14-sketch" ]] || exit 1
+
+          event_issue="$(jq -r '.issue.number // empty' "$GITHUB_EVENT_PATH")"
+          comment_author="$(jq -r '.comment.user.login // empty' "$GITHUB_EVENT_PATH")"
+          comment_body="$(jq -r '.comment.body // ""' "$GITHUB_EVENT_PATH")"
+
+          jq -e '.issue.pull_request == null' "$GITHUB_EVENT_PATH" > /dev/null
+
+          [[ "$event_issue" == "$TASK_ISSUE" ]] || exit 1
+          [[ "$comment_author" == "$GITHUB_ACTOR" ]] || exit 1
+          [[ "$comment_body" == *"@claude"* ]] || exit 1
+
+          issue="$(gh api "repos/$GITHUB_REPOSITORY/issues/$TASK_ISSUE")"
+
+          [[ "$(jq -r '.state' <<< "$issue")" == "open" ]] || exit 1
+
+          risk="$(jq -r '[.labels[].name | select(startswith("risk:"))] | join(",")' <<< "$issue")"
+
+          case "$risk" in
+            risk:R0|risk:R1|risk:R2) ;;
+            *) echo "::error::Invalid or blocked risk"; exit 1 ;;
+          esac
+
+          contract="$(jq -r '.body // ""' <<< "$issue")"
+
+          for heading in \
+            "## OBJECTIVE" \
+            "## SCOPE" \
+            "## OUT OF SCOPE" \
+            "## ACCEPTANCE" \
+            "## RISK" \
+            "## RUNTIME PROOF" \
+            "## STOP CONDITIONS"; do
+            [[ "$contract" == *"$heading"* ]] || {
+              echo "::error::Missing $heading"
+              exit 1
+            }
+          done
+
+  builder:
+    name: Claude Builder
+    needs: preflight
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      id-token: write
+
+    steps:
+      - name: Checkout consumer repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+
+      - name: Run official Claude Code Action
+        uses: anthropics/claude-code-action@6fed3ca145920b639991cb756090506e1bcaf515
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: |
+            --append-system-prompt "Follow the linked Issue Task Contract. Never modify .github/, tools/autopilot/, infra/, deploy/ or secrets. Never merge or deploy."
