@@ -33,6 +33,10 @@ jobs:
       sha: ${{ steps.policy.outputs.sha }}
       issue: ${{ steps.policy.outputs.issue }}
       risk: ${{ steps.policy.outputs.risk }}
+      ci_run: ${{ steps.policy.outputs.ci_run }}
+      reviewer_run: ${{ steps.policy.outputs.reviewer_run }}
+      contract_hash: ${{ steps.policy.outputs.contract_hash }}
+      base: ${{ steps.policy.outputs.base }}
     steps:
       - id: policy
         env:
@@ -116,6 +120,10 @@ jobs:
               fi ;;
           esac
           {
+            echo "ci_run=$ci_id"
+            echo "reviewer_run=$REVIEW_RUN"
+            echo "contract_hash=$(jq -r '.body // ""' <<< "$issue" | sha256sum | awk '{print $1}')"
+            echo "base=$base"
             echo "decision=$decision"
             echo "sha=$SHA"
             echo "issue=$task"
@@ -159,13 +167,22 @@ jobs:
           SHA: ${{ needs.decide.outputs.sha }}
           TASK_ID: ${{ needs.decide.outputs.issue }}
           RISK: ${{ needs.decide.outputs.risk }}
+          CI_RUN: ${{ needs.decide.outputs.ci_run }}
+          REVIEW_RUN: ${{ needs.decide.outputs.reviewer_run }}
+          CONTRACT_HASH: ${{ needs.decide.outputs.contract_hash }}
+          EXPECTED_BASE: ${{ needs.decide.outputs.base }}
+          REQUIRED: ${{ inputs.required_jobs_csv }}
         shell: bash
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY_OWNER" = nexagnet
           test "$GITHUB_REPOSITORY" != nexagnet/.github
           pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR")"
-          jq -e --arg sha "$SHA" '.state == "open" and .head.sha == $sha' <<< "$pr" >/dev/null
+          jq -e --arg sha "$SHA" --arg base "$EXPECTED_BASE" --arg repo "$GITHUB_REPOSITORY" '
+            .state == "open" and .head.sha == $sha and .base.ref == $base
+            and .head.repo.full_name == $repo and .base.repo.full_name == $repo
+            and .user.login == "nexagnet-builder-publisher[bot]"
+          ' <<< "$pr" >/dev/null
           issue="$(gh api "repos/$GITHUB_REPOSITORY/issues/$TASK_ID")"
           jq -e --arg risk "risk:$RISK" '
             .state == "open" and
@@ -174,6 +191,36 @@ jobs:
             and ([.labels[].name] | index("autopilot:auto-merge") != null)
           ' <<< "$issue" >/dev/null
           case "$RISK" in R0|R1) ;; *) exit 1 ;; esac
+          contract_hash="$(jq -r '.body // ""' <<< "$issue" | sha256sum | awk '{print $1}')"
+          test "$contract_hash" = "$CONTRACT_HASH" || { echo "::error::Task Contract changed"; exit 1; }
+          # Refuse stale Reviewer or a newer queued/failed CI on the SAME HEAD.
+          reviewed="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$REVIEW_RUN")"
+          jq -e --arg repo "$GITHUB_REPOSITORY" '
+            .name == "Nexagnet Reviewer caller"
+            and .path == ".github/workflows/nexagnet-claude-reviewer.yml"
+            and .status == "completed" and .conclusion == "success"
+            and .repository.full_name == $repo
+          ' <<< "$reviewed" >/dev/null
+          ci="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CI_RUN")"
+          jq -e --arg sha "$SHA" --arg repo "$GITHUB_REPOSITORY" --argjson pr "$PR" '
+            .name == "ci" and .path == ".github/workflows/ci.yml"
+            and .event == "pull_request" and .status == "completed"
+            and .conclusion == "success" and .head_sha == $sha
+            and .repository.full_name == $repo
+            and ([.pull_requests[]?.number] | length == 1 and .[0] == $pr)
+          ' <<< "$ci" >/dev/null
+          latest="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$SHA&event=pull_request&per_page=10")"
+          jq -e --argjson id "$CI_RUN" '.workflow_runs | length > 0 and .[0].id == $id and .[0].status == "completed" and .[0].conclusion == "success"' <<< "$latest" >/dev/null
+          jobs="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CI_RUN/jobs?per_page=100")"
+          test "$(jq -r .total_count <<< "$jobs")" -le 100
+          [[ "$REQUIRED" == *,* ]]
+          for name in $(tr ',' ' ' <<< "$REQUIRED"); do
+            [[ "$name" =~ ^[a-zA-Z][a-zA-Z0-9_-]{1,63}$ ]]
+            jq -e --arg n "$name" '[.jobs[] | select(.name == $n and .status == "completed" and .conclusion == "success")] | length == 1' <<< "$jobs" >/dev/null
+          done
+          files="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files?per_page=100")"
+          test "$(jq length <<< "$files")" -lt 100
+          jq -e 'all(.[]; (.filename | ascii_downcase | test("(^|/)(\\.github|\\.claude)/|^infra/|^deploy/|^tools/autopilot/|(^|/)(agents\\.md|claude\\.md|\\.mcp\\.json|\\.env(\\..*)?)$") | not))' <<< "$files" >/dev/null
       - name: Mint separately approved, repository-scoped MERGE App token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         id: merge_token
