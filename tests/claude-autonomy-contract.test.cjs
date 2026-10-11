@@ -49,9 +49,13 @@ test('privileged merge step checks current head, labels and risk, no bypass',()=
   assert.match(preMerge,/autopilot:auto-merge/);
   assert.match(preMerge,/case "\$RISK" in R0\|R1/);
   assert.match(native,/gh pr ready/);
-  assert.match(native,/gh pr merge "\$PR" --auto --squash --match-head-commit "\$SHA"/);
+  assert.match(native,/gh pr merge "\$PR" --squash --match-head-commit "\$SHA"/);
+  assert.doesNotMatch(native,/--auto/);
+  assert.match(preMerge,/effective_rules=.*rules\/branches/);
+  assert.match(preMerge,/\.type != "merge_queue"/);
+  assert.match(preMerge,/\.type == "required_status_checks"/);
   assert.doesNotMatch(native,/--admin|--force/);
-  assert.match(native,/does NOT prove exact-main CI or runtime/);
+  assert.match(native,/exact-main CI separately/);
 });
 test('merge job rechecks immutable contract, current Reviewer, latest CI, all jobs and protected paths',()=>{
   const outputs=jobs.decide.outputs;
