@@ -1,0 +1,261 @@
+name: Nexagnet Shared Autonomy (conditional R0/R1 only)
+
+# Canonical R3 Issue: https://github.com/nexagnet/.github/issues/8
+# This cannot be enabled until R3 merge credential and ruleset are owner-approved.
+on:
+  workflow_call:
+    inputs:
+      pr_number: {required: true, type: number}
+      expected_head_sha: {required: true, type: string}
+      reviewer_run_id: {required: true, type: number}
+      required_jobs_csv: {required: true, type: string}
+    secrets:
+      AUTONOMY_MERGE_APP_ID: {required: true}
+      AUTONOMY_MERGE_APP_PRIVATE_KEY: {required: true}
+permissions: {}
+concurrency:
+  group: nexagnet-autonomy-${{ github.repository }}-${{ inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  decide:
+    name: Live PR, CI, reviewer and risk gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      issues: read
+      pull-requests: read
+      checks: read
+    outputs:
+      decision: ${{ steps.policy.outputs.decision }}
+      sha: ${{ steps.policy.outputs.sha }}
+      issue: ${{ steps.policy.outputs.issue }}
+      risk: ${{ steps.policy.outputs.risk }}
+      ci_run: ${{ steps.policy.outputs.ci_run }}
+      reviewer_run: ${{ steps.policy.outputs.reviewer_run }}
+      contract_hash: ${{ steps.policy.outputs.contract_hash }}
+      base: ${{ steps.policy.outputs.base }}
+      branch: ${{ steps.policy.outputs.branch }}
+    steps:
+      - id: policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr_number }}
+          SHA: ${{ inputs.expected_head_sha }}
+          REVIEW_RUN: ${{ inputs.reviewer_run_id }}
+          REQUIRED: ${{ inputs.required_jobs_csv }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY_OWNER" = nexagnet
+          test "$GITHUB_REPOSITORY" != nexagnet/.github
+          test "$GITHUB_EVENT_NAME" = workflow_run
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PR" =~ ^[1-9][0-9]*$ && "$REVIEW_RUN" =~ ^[1-9][0-9]*$ ]]
+          jq -e --argjson id "$REVIEW_RUN" '.action == "completed" and .workflow_run.id == $id and .workflow_run.conclusion == "success"' "$GITHUB_EVENT_PATH" >/dev/null
+          run="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$REVIEW_RUN")"
+          jq -e --arg repo "$GITHUB_REPOSITORY" '
+            .name == "Nexagnet Reviewer caller"
+            and .path == ".github/workflows/nexagnet-claude-reviewer.yml"
+            and .event == "workflow_run" and .status == "completed"
+            and .conclusion == "success" and .repository.full_name == $repo
+          ' <<< "$run" >/dev/null
+          pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR")"
+          base="$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)"
+          jq -e --arg sha "$SHA" --arg repo "$GITHUB_REPOSITORY" --arg base "$base" '
+            .state == "open" and .head.sha == $sha
+            and .head.repo.full_name == $repo and .base.repo.full_name == $repo
+            and .base.ref == $base
+            and .user.login == "nexagnet-builder-publisher[bot]"
+          ' <<< "$pr" >/dev/null
+          branch="$(jq -r .head.ref <<< "$pr")"
+          [[ "$branch" =~ ^claude/issue-([1-9][0-9]*)-[1-9][0-9]*-[1-9][0-9]*$ ]]
+          task="$(printf '%s' "$branch" | sed -nE 's@^claude/issue-([0-9]+)-.*@\1@p')"
+          issue="$(gh api "repos/$GITHUB_REPOSITORY/issues/$task")"
+          jq -e '.state == "open" and (has("pull_request") | not)' <<< "$issue" >/dev/null
+          risk="$(jq -r '[.labels[].name | select(startswith("risk:"))] | join(",")' <<< "$issue")"
+          case "$risk" in risk:R0|risk:R1|risk:R2) ;; *) echo "::error::R3/unknown/conflicting risk is blocked"; exit 1 ;; esac
+          jq -e '[.labels[].name] | index("autopilot:ready") != null' <<< "$issue" >/dev/null
+          for h in '## OBJECTIVE' '## SCOPE' '## OUT OF SCOPE' '## ACCEPTANCE' '## RISK' '## RUNTIME PROOF' '## STOP CONDITIONS'; do
+            jq -er '.body // ""' <<< "$issue" | grep -Fxq "$h"
+          done
+          mkdir -p "$RUNNER_TEMP/reviewer"
+          gh run download "$REVIEW_RUN" -n nexagnet-review-evidence -D "$RUNNER_TEMP/reviewer" --repo "$GITHUB_REPOSITORY"
+          evidence="$RUNNER_TEMP/reviewer/review-evidence.json"
+          test -s "$evidence"
+          test "$(wc -c < "$evidence")" -le 30000
+          jq -e --arg sha "$SHA" --argjson pr "$PR" --argjson issue "$task" --arg risk "$(cut -d: -f2 <<< "$risk")" '
+            .schema == "nexagnet-review-v1" and .pr == $pr and .issue == $issue
+            and .head_sha == $sha and .risk == $risk
+            and .review.head_sha == $sha and .review.verdict == "PASS"
+          ' "$evidence" >/dev/null
+          ci_id="$(jq -r .ci_run_id "$evidence")"
+          ci="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$ci_id")"
+          jq -e --arg sha "$SHA" --arg repo "$GITHUB_REPOSITORY" --argjson pr "$PR" '
+            .name == "ci" and .path == ".github/workflows/ci.yml"
+            and .status == "completed" and .conclusion == "success"
+            and .head_sha == $sha and .event == "pull_request"
+            and .repository.full_name == $repo
+            and ([.pull_requests[]?.number] | length == 1 and .[0] == $pr)
+          ' <<< "$ci" >/dev/null
+          jobs="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$ci_id/jobs?per_page=100")"
+          test "$(jq -r .total_count <<< "$jobs")" -le 100
+          [[ "$REQUIRED" == *,* ]]
+          for name in $(tr ',' ' ' <<< "$REQUIRED"); do
+            [[ "$name" =~ ^[a-zA-Z][a-zA-Z0-9_-]{1,63}$ ]]
+            jq -e --arg n "$name" '[.jobs[] |
+              select(.name == $n and .status == "completed" and .conclusion == "success")] | length == 1' <<< "$jobs" >/dev/null
+          done
+          files="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files?per_page=100")"
+          test "$(jq length <<< "$files")" -lt 100
+          jq -e 'all(.[]; (.filename | ascii_downcase |
+            test("(^|/)(\\.github|\\.claude)/|^infra/|^deploy/|^tools/autopilot/|(^|/)(agents\\.md|claude\\.md|\\.mcp\\.json|\\.env(\\..*)?)$") | not))' <<< "$files" >/dev/null
+          decision=NO_AUTOMERGE
+          case "$risk" in
+            risk:R2) decision=NEEDS_OWNER ;;
+            risk:R0|risk:R1)
+              if jq -e '[.labels[].name] | index("autopilot:auto-merge") != null' <<< "$issue" >/dev/null; then
+                decision=R0_R1_AUTO_MERGE
+              fi ;;
+          esac
+          {
+            echo "ci_run=$ci_id"
+            echo "reviewer_run=$REVIEW_RUN"
+            echo "contract_hash=$(jq -r '.body // ""' <<< "$issue" | sha256sum | awk '{print $1}')"
+            echo "base=$base"
+            echo "branch=$branch"
+            echo "decision=$decision"
+            echo "sha=$SHA"
+            echo "issue=$task"
+            echo "risk=$(cut -d: -f2 <<< "$risk")"
+          } >> "$GITHUB_OUTPUT"
+
+  human:
+    name: R2 human approval gate (no merge token)
+    needs: decide
+    if: needs.decide.outputs.decision == 'NEEDS_OWNER'
+    runs-on: ubuntu-24.04
+    permissions:
+      issues: write
+    steps:
+      - name: Report R2 exact-head human merge gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr_number }}
+          SHA: ${{ needs.decide.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+            -f body="NEEDS_OWNER: R2 PR at exact HEAD $SHA. Human-controlled merge only; no auto-merge token used."
+
+  merge:
+    name: Immediate risk-gated merge for opted-in R0/R1 only
+    needs: decide
+    if: needs.decide.outputs.decision == 'R0_R1_AUTO_MERGE'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    steps:
+      - name: Re-fetch all merge gates before privileged token
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr_number }}
+          SHA: ${{ needs.decide.outputs.sha }}
+          TASK_ID: ${{ needs.decide.outputs.issue }}
+          RISK: ${{ needs.decide.outputs.risk }}
+          CI_RUN: ${{ needs.decide.outputs.ci_run }}
+          REVIEW_RUN: ${{ needs.decide.outputs.reviewer_run }}
+          CONTRACT_HASH: ${{ needs.decide.outputs.contract_hash }}
+          EXPECTED_BASE: ${{ needs.decide.outputs.base }}
+          EXPECTED_BRANCH: ${{ needs.decide.outputs.branch }}
+          REQUIRED: ${{ inputs.required_jobs_csv }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY_OWNER" = nexagnet
+          test "$GITHUB_REPOSITORY" != nexagnet/.github
+          pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR")"
+          jq -e --arg sha "$SHA" --arg base "$EXPECTED_BASE" --arg branch "$EXPECTED_BRANCH" --arg repo "$GITHUB_REPOSITORY" '
+            .state == "open" and .head.sha == $sha and .base.ref == $base
+            and .head.ref == $branch
+            and .head.repo.full_name == $repo and .base.repo.full_name == $repo
+            and .user.login == "nexagnet-builder-publisher[bot]"
+          ' <<< "$pr" >/dev/null
+          issue="$(gh api "repos/$GITHUB_REPOSITORY/issues/$TASK_ID")"
+          jq -e --arg risk "risk:$RISK" '
+            .state == "open" and
+            ([.labels[].name | select(startswith("risk:"))] == [$risk])
+            and ([.labels[].name] | index("autopilot:ready") != null)
+            and ([.labels[].name] | index("autopilot:auto-merge") != null)
+          ' <<< "$issue" >/dev/null
+          case "$RISK" in R0|R1) ;; *) exit 1 ;; esac
+          actual_digest="$(jq -r '.body // ""' <<< "$issue" | sha256sum | awk '{print $1}')"
+          test "$actual_digest" = "$CONTRACT_HASH" || { echo "::error::Task Contract changed"; exit 1; }
+          # Refuse stale Reviewer or a newer queued/failed CI on the SAME HEAD.
+          reviewed="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$REVIEW_RUN")"
+          jq -e --arg repo "$GITHUB_REPOSITORY" '
+            .name == "Nexagnet Reviewer caller"
+            and .path == ".github/workflows/nexagnet-claude-reviewer.yml"
+            and .status == "completed" and .conclusion == "success"
+            and .repository.full_name == $repo
+          ' <<< "$reviewed" >/dev/null
+          ci="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CI_RUN")"
+          jq -e --arg sha "$SHA" --arg repo "$GITHUB_REPOSITORY" --argjson pr "$PR" '
+            .name == "ci" and .path == ".github/workflows/ci.yml"
+            and .event == "pull_request" and .status == "completed"
+            and .conclusion == "success" and .head_sha == $sha
+            and .repository.full_name == $repo
+            and ([.pull_requests[]?.number] | length == 1 and .[0] == $pr)
+          ' <<< "$ci" >/dev/null
+          latest="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$SHA&event=pull_request&per_page=10")"
+          jq -e --argjson id "$CI_RUN" '.workflow_runs | length > 0 and .[0].id == $id and .[0].status == "completed" and .[0].conclusion == "success"' <<< "$latest" >/dev/null
+          jobs="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CI_RUN/jobs?per_page=100")"
+          test "$(jq -r .total_count <<< "$jobs")" -le 100
+          [[ "$REQUIRED" == *,* ]]
+          for name in $(tr ',' ' ' <<< "$REQUIRED"); do
+            [[ "$name" =~ ^[a-zA-Z][a-zA-Z0-9_-]{1,63}$ ]]
+            jq -e --arg n "$name" '[.jobs[] | select(.name == $n and .status == "completed" and .conclusion == "success")] | length == 1' <<< "$jobs" >/dev/null
+          done
+          # If branch rules cannot be read, no auto-merge authority is issued.
+          # Pending merge-queue entries could outlive a revoked opt-in label.
+          effective_rules="$(gh api "repos/$GITHUB_REPOSITORY/rules/branches/$EXPECTED_BASE?per_page=100")"
+          jq -e '
+            type == "array" and length > 0 and length < 100
+            and (all(.[]; .type != "merge_queue"))
+            and any(.[]; .type == "required_status_checks" or .type == "pull_request")
+          ' <<< "$effective_rules" >/dev/null || {
+            echo "::error::Missing verified protective rules or merge queue present"; exit 1;
+          }
+          files="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files?per_page=100")"
+          test "$(jq length <<< "$files")" -lt 100
+          jq -e 'all(.[]; (.filename | ascii_downcase | test("(^|/)(\\.github|\\.claude)/|^infra/|^deploy/|^tools/autopilot/|(^|/)(agents\\.md|claude\\.md|\\.mcp\\.json|\\.env(\\..*)?)$") | not))' <<< "$files" >/dev/null
+      - name: Mint separately approved, repository-scoped MERGE App token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        id: merge_token
+        with:
+          app-id: ${{ secrets.AUTONOMY_MERGE_APP_ID }}
+          private-key: ${{ secrets.AUTONOMY_MERGE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Mark ready and merge immediately only with current proof
+        env:
+          GH_TOKEN: ${{ steps.merge_token.outputs.token }}
+          PR: ${{ inputs.pr_number }}
+          SHA: ${{ needs.decide.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq .head.sha)" = "$SHA"
+          gh pr ready "$PR" --repo "$GITHUB_REPOSITORY"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq .head.sha)" = "$SHA"
+          # Do not enqueue delayed auto-merge; it could outlive owner opt-in labels.
+          gh pr merge "$PR" --squash --match-head-commit "$SHA" --repo "$GITHUB_REPOSITORY"
+          echo "Immediate risk-gated merge requested; verify merge SHA and exact-main CI separately."
