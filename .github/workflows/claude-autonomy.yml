@@ -191,8 +191,8 @@ jobs:
             and ([.labels[].name] | index("autopilot:auto-merge") != null)
           ' <<< "$issue" >/dev/null
           case "$RISK" in R0|R1) ;; *) exit 1 ;; esac
-          contract_hash="$(jq -r '.body // ""' <<< "$issue" | sha256sum | awk '{print $1}')"
-          test "$contract_hash" = "$CONTRACT_HASH" || { echo "::error::Task Contract changed"; exit 1; }
+          actual_digest="$(jq -r '.body // ""' <<< "$issue" | sha256sum | awk '{print $1}')"
+          test "$actual_digest" = "$CONTRACT_HASH" || { echo "::error::Task Contract changed"; exit 1; }
           # Refuse stale Reviewer or a newer queued/failed CI on the SAME HEAD.
           reviewed="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$REVIEW_RUN")"
           jq -e --arg repo "$GITHUB_REPOSITORY" '
