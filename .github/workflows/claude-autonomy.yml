@@ -81,7 +81,7 @@ jobs:
             jq -er '.body // ""' <<< "$issue" | grep -Fxq "$h"
           done
           mkdir -p "$RUNNER_TEMP/reviewer"
-          gh run download "$REVIEW_RUN" -n nexagnet-review-evidence -D "$RUNNER_TEMP/reviewer"
+          gh run download "$REVIEW_RUN" -n nexagnet-review-evidence -D "$RUNNER_TEMP/reviewer" --repo "$GITHUB_REPOSITORY"
           evidence="$RUNNER_TEMP/reviewer/review-evidence.json"
           test -s "$evidence"
           test "$(wc -c < "$evidence")" -le 30000
