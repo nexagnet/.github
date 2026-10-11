@@ -28,6 +28,7 @@ jobs:
       issue: ${{ steps.check.outputs.issue }}
       risk: ${{ steps.check.outputs.risk }}
       evidence: ${{ steps.check.outputs.evidence }}
+      contract_hash: ${{ steps.check.outputs.contract_hash }}
     steps:
       - id: check
         shell: bash
@@ -52,10 +53,11 @@ jobs:
             and .repository.full_name == $repo
           ' <<< "$source" >/dev/null
           pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR")"
-          jq -e --arg sha "$SHA" --arg repo "$GITHUB_REPOSITORY" '
+          base="$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)"
+          jq -e --arg sha "$SHA" --arg repo "$GITHUB_REPOSITORY" --arg base "$base" '
             .state == "open" and .head.sha == $sha
             and .head.repo.full_name == $repo
-            and .base.repo.full_name == $repo
+            and .base.repo.full_name == $repo and .base.ref == $base
             and .user.login == "nexagnet-builder-publisher[bot]"
           ' <<< "$pr" >/dev/null
           branch="$(jq -r .head.ref <<< "$pr")"
@@ -89,6 +91,7 @@ jobs:
             echo "branch=$branch"
             echo "issue=$issue_id"
             echo "risk=$(cut -d: -f2 <<< "$risk")"
+            echo "contract_hash=$(jq -r '.body // ""' <<< "$issue" | sha256sum | awk '{print $1}')"
             echo "evidence=$(base64 -w0 "$evidence")"
           } >> "$GITHUB_OUTPUT"
   agent:
@@ -172,6 +175,7 @@ jobs:
           BRANCH: ${{ needs.gate.outputs.branch }}
           TASK_ID: ${{ needs.gate.outputs.issue }}
           RISK: ${{ needs.gate.outputs.risk }}
+          CONTRACT_HASH: ${{ needs.gate.outputs.contract_hash }}
           PATCH: ${{ runner.temp }}/untrusted/repair.patch
         run: |
           set -euo pipefail
@@ -179,9 +183,12 @@ jobs:
           test "$GITHUB_REPOSITORY" != nexagnet/.github
           test "$(git rev-parse HEAD)" = "$SHA"
           pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR")"
-          jq -e --arg sha "$SHA" --arg branch "$BRANCH" '.state == "open" and .head.sha == $sha and .head.ref == $branch' <<< "$pr" >/dev/null
+          base="$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)"
+          jq -e --arg sha "$SHA" --arg branch "$BRANCH" --arg base "$base" '.state == "open" and .head.sha == $sha and .head.ref == $branch and .base.ref == $base' <<< "$pr" >/dev/null
           issue="$(gh api "repos/$GITHUB_REPOSITORY/issues/$TASK_ID")"
           jq -e --arg risk "risk:$RISK" '.state == "open" and ([.labels[].name | select(startswith("risk:"))] == [$risk]) and ([.labels[].name] | index("autopilot:ready") != null)' <<< "$issue" >/dev/null
+          actual_hash="$(jq -r '.body // ""' <<< "$issue" | sha256sum | awk '{print $1}')"
+          test "$actual_hash" = "$CONTRACT_HASH" || { echo "::error::Task Contract changed"; exit 1; }
           test -s "$PATCH"
           test "$(wc -c < "$PATCH")" -le 5242880
           git apply --check --index "$PATCH"
