@@ -30,4 +30,4 @@ jobs:
       - name: Validate YAML and executable trust-boundary tests
         run: node --test tests/claude-builder-contract.test.cjs tests/claude-reviewer-contract.test.cjs
       - name: Fail-closed organization discovery tests
-        run: node --test tools/repo-onboarding/audit.test.mjs
+        run: node --test tools/repo-onboarding/audit.test.mjs tools/repo-onboarding/plan.test.mjs
