@@ -44,6 +44,17 @@ test('AI job has no GitHub write permission, OIDC or publisher credential', () =
   assert.match(step.with.claude_args, /--disallowedTools "Bash,WebFetch,WebSearch"/);
 });
 
+test('Claude receives the frozen canonical Task Contract only after ready gate', () => {
+  assert.match(preflight, /autopilot:ready/);
+  assert.match(preflight, /contract_b64=.*base64/);
+  const mount = agent.steps.find(s => s.name?.startsWith('Mount frozen Task Contract'));
+  assert.ok(mount);
+  assert.match(mount.run, /base64 -d/);
+  const step = agent.steps.find(s => s.name?.startsWith('Claude proposes'));
+  assert.match(step.with.prompt, /task-contract\.md/);
+  assert.match(validator, /Issue readiness revoked/);
+});
+
 test('privileged publisher is strictly downstream from validation', () => {
   assert.deepEqual(publish.needs, ['preflight', 'agent']);
   assert.equal(publish.permissions.contents, 'read');
@@ -137,7 +148,7 @@ test('preflight rejects invalid actor/event and missing/conflicting/R3 risk', ()
     const headings = ['OBJECTIVE','SCOPE','OUT OF SCOPE','ACCEPTANCE','RISK','RUNTIME PROOF','STOP CONDITIONS']
       .map(h => '## ' + h).join('\n');
     const validEvent = { action: 'created', issue: { number: 12 }, comment: { user: { login: 'phungtienviet14-sketch' }, body: '@claude' } };
-    const validIssue = { state: 'open', labels: [{name:'risk:R1'}], body: headings };
+    const validIssue = { state: 'open', labels: [{name:'risk:R1'}, {name:'autopilot:ready'}], body: headings };
     function call(event, issue, actor = 'phungtienviet14-sketch', repository = 'nexagnet/example') {
       writeFileSync(eventFile, JSON.stringify(event));
       writeFileSync(issueFile, JSON.stringify(issue));
@@ -155,6 +166,7 @@ test('preflight rejects invalid actor/event and missing/conflicting/R3 risk', ()
     }
     assert.equal(call(validEvent, validIssue), true);
     assert.equal(call(validEvent, { ...validIssue, state: 'closed' }), false);
+    assert.equal(call(validEvent, { ...validIssue, labels: [{name:'risk:R1'}] }), false);
     assert.equal(call(validEvent, { ...validIssue, labels: [{name:'risk:R3'}] }), false);
     assert.equal(call(validEvent, { ...validIssue, labels: [{name:'risk:R1'},{name:'risk:R2'}] }), false);
     assert.equal(call(validEvent, { ...validIssue, body:'## OBJECTIVE' }), false);
