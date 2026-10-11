@@ -11,7 +11,7 @@ const caller=(y.on||y.true).workflow_call;
 const gate=y.jobs.gate.steps.find(x=>x.id==='check').run;
 const agent=y.jobs.agent;
 const pub=y.jobs.publish;
-const guard=pub.steps.find(x=>x.name.startsWith('Verify patch')).run;
+const guard=pub.steps.find(x=>x.name?.startsWith('Verify patch')).run;
 const push=pub.steps.at(-1).run;
 
 test('requires trusted Reviewer workflow run, exact SHA and structured evidence',()=>{
@@ -33,7 +33,7 @@ test('untrusted Claude lacks Publisher credentials, OIDC and GitHub write',()=>{
   assert.equal(agent.permissions['pull-requests'],'read');
   assert.equal(agent.permissions['id-token'],undefined);
   assert.ok(!JSON.stringify(agent).includes('BUILDER_PUBLISHER_APP_PRIVATE_KEY'));
-  const step=agent.steps.find(x=>x.name.startsWith('Repair locally'));
+  const step=agent.steps.find(x=>x.name?.startsWith('Repair locally'));
   assert.equal(step.with.github_token,'${{ github.token }}');
   assert.match(step.with.claude_args,/--disallowedTools "Bash,WebFetch,WebSearch"/);
   assert.match(step.with.prompt,/trusted-review\.json/);
@@ -41,7 +41,7 @@ test('untrusted Claude lacks Publisher credentials, OIDC and GitHub write',()=>{
 test('clean publisher validates untrusted patch before minting limited App token',()=>{
   assert.deepEqual(pub.needs,['gate','agent']);
   assert.equal(pub.permissions.contents,'read');
-  const g=pub.steps.findIndex(x=>x.name.startsWith('Verify patch'));
+  const g=pub.steps.findIndex(x=>x.name?.startsWith('Verify patch'));
   const t=pub.steps.findIndex(x=>x.id==='publisher');
   assert.ok(t>g);
   assert.match(guard,/git apply --check --index/);
