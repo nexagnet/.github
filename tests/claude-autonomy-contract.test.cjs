@@ -24,6 +24,7 @@ test('risk R3 unknown or conflict always fails, R2 owner-only, R0/R1 require exp
   assert.doesNotMatch(policy,/risk:R3\) *;;/);
   assert.match(policy,/risk:R2\) decision=NEEDS_OWNER/);
   assert.match(policy,/autopilot:auto-merge/);
+  assert.match(policy,/gh run download "\$REVIEW_RUN" .*--repo "\$GITHUB_REPOSITORY"/);
   assert.match(policy,/autopilot:ready/);
   assert.match(policy,/R0_R1_AUTO_MERGE/);
   assert.match(jobs.merge.if,/R0_R1_AUTO_MERGE/);
@@ -51,6 +52,22 @@ test('privileged merge step checks current head, labels and risk, no bypass',()=
   assert.match(native,/gh pr merge "\$PR" --auto --squash --match-head-commit "\$SHA"/);
   assert.doesNotMatch(native,/--admin|--force/);
   assert.match(native,/does NOT prove exact-main CI or runtime/);
+});
+test('merge job rechecks immutable contract, current Reviewer, latest CI, all jobs and protected paths',()=>{
+  const outputs=jobs.decide.outputs;
+  for(const k of ['ci_run','reviewer_run','contract_hash','base'])assert.ok(outputs[k],k);
+  assert.match(preMerge,/Task Contract changed/);
+  assert.match(preMerge,/Nexagnet Reviewer caller/);
+  assert.match(preMerge,/workflow_runs \| length > 0/);
+  assert.match(preMerge,/\.\[0\]\.id == \$id/);
+  assert.match(preMerge,/\.head_sha == \$sha/);
+  assert.match(preMerge,/\.pull_requests\[\]\?\.number/);
+  assert.match(preMerge,/jobs\?per_page=100/);
+  assert.match(preMerge,/pulls\/\$PR\/files\?per_page=100/);
+  assert.match(preMerge,/\.base\.ref == \$base/);
+  assert.match(preMerge,/risk:\$RISK/);
+  assert.ok(jobs.merge.steps.find(x=>x.id==='merge_token'));
+  assert.ok(jobs.merge.steps.findIndex(x=>x.id==='merge_token') > 0);
 });
 test('all dependencies pinned to 40-char SHA; no inherited secrets',()=>{
   const actions=[...src.matchAll(/uses:\s*([^\s@]+)@([0-9a-f]{40})/g)];

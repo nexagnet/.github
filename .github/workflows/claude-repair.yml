@@ -72,7 +72,7 @@ jobs:
           count="$(jq '[.[] | select(.commit.message | startswith("repair: validated issue"))] | length' <<< "$commits")"
           test "$count" -lt 2 || { echo "::error::Repair limit reached"; exit 1; }
           mkdir -p "$RUNNER_TEMP/review"
-          gh run download "$RUN" -n nexagnet-review-evidence -D "$RUNNER_TEMP/review"
+          gh run download "$RUN" -n nexagnet-review-evidence -D "$RUNNER_TEMP/review" --repo "$GITHUB_REPOSITORY"
           evidence="$RUNNER_TEMP/review/review-evidence.json"
           test -s "$evidence"
           test "$(wc -c < "$evidence")" -le 30000
