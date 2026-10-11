@@ -213,3 +213,18 @@ jobs:
             "$verdict" "$SHA" "$RUN" "$TASK_ID" "$RISK" "$summary" "$findings")"
           jq -n --arg body "$msg" '{body:$body}' |
             gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --input - --jq .html_url
+          # This JSON artifact is created by the trusted, exact-head reporter,
+          # NOT by the untrusted PR or a model-authored PR comment.
+          jq -n --argjson review "$RESULT" --arg sha "$SHA" \
+            --argjson pr "$PR" --argjson issue "$TASK_ID" \
+            --argjson ci "$RUN" --arg risk "$RISK" \
+            '{schema:"nexagnet-review-v1", head_sha:$sha, pr:$pr,
+              issue:$issue, ci_run_id:$ci, risk:$risk, review:$review}' \
+            > "$RUNNER_TEMP/review-evidence.json"
+      - name: Upload exact-head reviewer evidence for trusted consumers
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nexagnet-review-evidence
+          path: ${{ runner.temp }}/review-evidence.json
+          if-no-files-found: error
+          retention-days: 14
