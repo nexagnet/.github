@@ -107,16 +107,6 @@ jobs:
             jq -e --arg n "$name" '[.jobs[] |
               select(.name == $n and .status == "completed" and .conclusion == "success")] | length == 1' <<< "$jobs" >/dev/null
           done
-          # If branch rules cannot be read, no auto-merge authority is issued.
-          # Pending merge-queue entries could outlive a revoked opt-in label.
-          effective_rules="$(gh api "repos/$GITHUB_REPOSITORY/rules/branches/$EXPECTED_BASE?per_page=100")"
-          jq -e '
-            type == "array" and length > 0
-            and (all(.[]; .type != "merge_queue"))
-            and any(.[]; .type == "required_status_checks" or .type == "pull_request")
-          ' <<< "$effective_rules" >/dev/null || {
-            echo "::error::Missing verified protective rules or merge queue present"; exit 1;
-          }
           files="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files?per_page=100")"
           test "$(jq length <<< "$files")" -lt 100
           jq -e 'all(.[]; (.filename | ascii_downcase |
@@ -228,6 +218,16 @@ jobs:
             [[ "$name" =~ ^[a-zA-Z][a-zA-Z0-9_-]{1,63}$ ]]
             jq -e --arg n "$name" '[.jobs[] | select(.name == $n and .status == "completed" and .conclusion == "success")] | length == 1' <<< "$jobs" >/dev/null
           done
+          # If branch rules cannot be read, no auto-merge authority is issued.
+          # Pending merge-queue entries could outlive a revoked opt-in label.
+          effective_rules="$(gh api "repos/$GITHUB_REPOSITORY/rules/branches/$EXPECTED_BASE?per_page=100")"
+          jq -e '
+            type == "array" and length > 0
+            and (all(.[]; .type != "merge_queue"))
+            and any(.[]; .type == "required_status_checks" or .type == "pull_request")
+          ' <<< "$effective_rules" >/dev/null || {
+            echo "::error::Missing verified protective rules or merge queue present"; exit 1;
+          }
           files="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files?per_page=100")"
           test "$(jq length <<< "$files")" -lt 100
           jq -e 'all(.[]; (.filename | ascii_downcase | test("(^|/)(\\.github|\\.claude)/|^infra/|^deploy/|^tools/autopilot/|(^|/)(agents\\.md|claude\\.md|\\.mcp\\.json|\\.env(\\..*)?)$") | not))' <<< "$files" >/dev/null
