@@ -175,7 +175,7 @@ jobs:
           RUN: ${{ inputs.ci_run_id }}
           RESULT: ${{ needs.review.outputs.result }}
         run: |
-                    set -euo pipefail
+          set -euo pipefail
           test "$GITHUB_REPOSITORY_OWNER" = nexagnet
           test "$GITHUB_REPOSITORY" != nexagnet/.github
           test -n "$RESULT"
@@ -194,7 +194,7 @@ jobs:
           ' <<< "$RESULT" >/dev/null
           pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR")"
           jq -e --arg sha "$SHA" '.state == "open" and .head.sha == $sha' <<< "$pr" >/dev/null
-          issue="$(gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE")"
+          issue="$(gh api "repos/$GITHUB_REPOSITORY/issues/$TASK_ID")"
           jq -e --arg risk "risk:$RISK" '
             .state == "open" and ([.labels[].name | select(startswith("risk:"))] == [$risk])
           ' <<< "$issue" >/dev/null
