@@ -69,6 +69,9 @@ test('merge job rechecks immutable contract, current Reviewer, latest CI, all jo
   assert.match(preMerge,/jobs\?per_page=100/);
   assert.match(preMerge,/pulls\/\$PR\/files\?per_page=100/);
   assert.match(preMerge,/\.base\.ref == \$base/);
+  assert.match(preMerge,/\.head\.ref == \$branch/);
+  assert.match(preMerge,/length > 0 and length < 100/);
+  assert.ok(jobs.decide.outputs.branch);
   assert.match(preMerge,/risk:\$RISK/);
   assert.ok(jobs.merge.steps.find(x=>x.id==='merge_token'));
   assert.ok(jobs.merge.steps.findIndex(x=>x.id==='merge_token') > 0);
