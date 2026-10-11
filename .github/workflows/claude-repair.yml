@@ -170,7 +170,7 @@ jobs:
           PR: ${{ inputs.pr_number }}
           SHA: ${{ needs.gate.outputs.sha }}
           BRANCH: ${{ needs.gate.outputs.branch }}
-          ISSUE: ${{ needs.gate.outputs.issue }}
+          TASK_ID: ${{ needs.gate.outputs.issue }}
           RISK: ${{ needs.gate.outputs.risk }}
           PATCH: ${{ runner.temp }}/untrusted/repair.patch
         run: |
@@ -180,7 +180,7 @@ jobs:
           test "$(git rev-parse HEAD)" = "$SHA"
           pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR")"
           jq -e --arg sha "$SHA" --arg branch "$BRANCH" '.state == "open" and .head.sha == $sha and .head.ref == $branch' <<< "$pr" >/dev/null
-          issue="$(gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE")"
+          issue="$(gh api "repos/$GITHUB_REPOSITORY/issues/$TASK_ID")"
           jq -e --arg risk "risk:$RISK" '.state == "open" and ([.labels[].name | select(startswith("risk:"))] == [$risk]) and ([.labels[].name] | index("autopilot:ready") != null)' <<< "$issue" >/dev/null
           test -s "$PATCH"
           test "$(wc -c < "$PATCH")" -le 5242880
@@ -217,7 +217,7 @@ jobs:
           GH_TOKEN: ${{ steps.publisher.outputs.token }}
           SHA: ${{ needs.gate.outputs.sha }}
           BRANCH: ${{ needs.gate.outputs.branch }}
-          ISSUE: ${{ needs.gate.outputs.issue }}
+          TASK_ID: ${{ needs.gate.outputs.issue }}
           PR: ${{ inputs.pr_number }}
         run: |
           set -euo pipefail
@@ -226,7 +226,7 @@ jobs:
           git -c user.name='nexagnet-builder[bot]' \
               -c user.email='noreply@users.noreply.github.com' \
               -c core.hooksPath=/dev/null -c commit.gpgsign=false \
-              commit -m "repair: validated issue $ISSUE at $SHA"
+              commit -m "repair: validated issue $TASK_ID at $SHA"
           gh auth setup-git
           git push origin "HEAD:refs/heads/$BRANCH"
           echo "Repair pushed to SAME PR. CI and Reviewer must re-run on new HEAD."
