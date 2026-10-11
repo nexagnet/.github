@@ -41,6 +41,9 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY_OWNER" = "nexagnet"
+          test "$GITHUB_REPOSITORY" != "nexagnet/.github" || {
+            echo "::error::Control-plane repository is not a Builder consumer"; exit 1;
+          }
           test "$GITHUB_EVENT_NAME" = "issue_comment"
           test "$GITHUB_ACTOR" = "phungtienviet14-sketch"
           jq -e --arg actor "$GITHUB_ACTOR" --argjson number "$ISSUE_NUMBER" '
@@ -175,6 +178,9 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY_OWNER" = "nexagnet"
+          test "$GITHUB_REPOSITORY" != "nexagnet/.github" || {
+            echo "::error::Control-plane repository is not a Builder consumer"; exit 1;
+          }
           test -s "$PATCH"
           test "$(wc -c < "$PATCH")" -le 5242880
           test "$(git rev-parse HEAD)" = "$BASE_SHA"
