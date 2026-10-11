@@ -23,6 +23,7 @@ test('requires trusted Reviewer workflow run, exact SHA and structured evidence'
   }
 });
 test('bounded two attempts and PR-scoped concurrency',()=>{
+  assert.match(gate,/gh run download "\$RUN" .*--repo "\$GITHUB_REPOSITORY"/);
   assert.match(gate,/repair: validated issue/);
   assert.match(gate,/test "\$count" -lt 2/);
   assert.match(y.concurrency.group,/nexagnet-repair-/);
