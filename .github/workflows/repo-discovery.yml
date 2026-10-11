@@ -1,0 +1,58 @@
+name: Nexagnet Discovery and R3 Tracking
+
+# R3 Issue #5. Observes repos but CANNOT create workflows, change secrets,
+# merge PRs, deploy, or grant a GitHub App additional permissions.
+on:
+  schedule:
+    - cron: '31 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    name: Organization repository inventory (read only)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Discover visible Nexagnet repositories without mutating them
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node tools/repo-onboarding/audit.mjs
+      - name: Export discovery evidence (not activation proof)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nexagnet-repository-discovery
+          path: onboarding-discovery.json
+          if-no-files-found: error
+          retention-days: 7
+
+  track:
+    name: Create only missing R3 onboarding tracking Issues
+    needs: inventory
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: nexagnet-repository-discovery
+      - name: Re-verify GitHub live and create idempotent central R3 Issues only
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node tools/repo-onboarding/plan.mjs
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nexagnet-onboarding-tracking
+          path: onboarding-tracking.json
+          if-no-files-found: error
+          retention-days: 7
