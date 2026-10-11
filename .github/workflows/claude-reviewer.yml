@@ -202,8 +202,7 @@ jobs:
           jq -e --arg sha "$SHA" '.conclusion == "success" and .head_sha == $sha' <<< "$run" >/dev/null
           verdict="$(jq -r .verdict <<< "$RESULT")"
           summary="$(jq -r .summary <<< "$RESULT")"
-          findings="$(jq -r '[.findings[] |
-            "- \(.severity): \(.path):\(.line) - \(.message)"] | join("\n")' <<< "$RESULT")"
+          findings="$(jq -r '[.findings[] | .severity + " " + .path + ":" + (.line|tostring) + " " + .message] | join("\n")' <<< "$RESULT")"
           msg="$(printf 'NEXAGNET_REVIEWER %s\nHEAD_SHA: %s\nCI_RUN: %s\nISSUE: #%s\nRISK: R%s\n\n%s\n%s\n\nNot merge authorization.\n' \
             "$verdict" "$SHA" "$RUN" "$TASK_ID" "$RISK" "$summary" "$findings")"
           jq -n --arg body "$msg" '{body:$body}' |
