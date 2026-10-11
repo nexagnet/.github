@@ -62,10 +62,6 @@ test('deterministic preflight verifies exact-head CI, complete job set, issuer a
 test('protected path gate includes workflow, automation and instruction file attacks', () => {
   const check = preflight.match(/jq -e 'all\(\.\[\];[\s\S]*?' <<< "\$files" >\/dev\/null/);
   assert.ok(check, 'Expected fail-closed protection applied to GitHub PR file listing');
-  const regex = /test\("([^"]+)"\)/;
-  const match = check[0].match(regex);
-  assert.ok(match);
-  const pattern = new RegExp(JSON.parse('"' + match[1].replace(/\\/g, '\\\\') + '"'.replace(/\\/g, '\\\\')));
   // Also assert directly on the jq expression; integration proof remains required.
   for(const name of ['.github', '.claude', 'infra/', 'deploy/', 'tools/autopilot/', 'agents', 'claude', 'mcp']) {
     assert.ok(check[0].toLowerCase().includes(name), 'missing guard for: ' + name);
