@@ -24,6 +24,7 @@ test('risk R3 unknown or conflict always fails, R2 owner-only, R0/R1 require exp
   assert.doesNotMatch(policy,/risk:R3\) *;;/);
   assert.match(policy,/risk:R2\) decision=NEEDS_OWNER/);
   assert.match(policy,/autopilot:auto-merge/);
+  assert.match(policy,/gh run download "\$REVIEW_RUN" .*--repo "\$GITHUB_REPOSITORY"/);
   assert.match(policy,/autopilot:ready/);
   assert.match(policy,/R0_R1_AUTO_MERGE/);
   assert.match(jobs.merge.if,/R0_R1_AUTO_MERGE/);
