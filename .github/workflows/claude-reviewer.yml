@@ -68,6 +68,12 @@ jobs:
           test "$(grep -cE '[0-9]' <<< "$refs" || true)" = 1
           issue_id="$(awk '{print $NF}' <<< "$refs" | tr -d '#')"
           [[ "$issue_id" =~ ^[1-9][0-9]*$ ]]
+          # Only PRs emitted by the validated central Builder publisher may enter
+          # this Reviewer. Existing V4 autopilot branches remain on V4 Reviewer.
+          branch="$(jq -r .head.ref <<< "$pr")"
+          [[ "$branch" =~ ^claude/issue-([1-9][0-9]*)-([1-9][0-9]*)-([1-9][0-9]*)$ ]]
+          test "$(printf '%s' "$branch" | cut -d- -f2)" = "$issue_id"
+          jq -e '.user.login == "nexagnet-builder-publisher[bot]" and .user.type == "Bot"' <<< "$pr" >/dev/null
           issue="$(gh api "repos/$GITHUB_REPOSITORY/issues/$issue_id")"
           jq -e '.state == "open" and (has("pull_request") | not)' <<< "$issue" >/dev/null
           risk="$(jq -r '[.labels[].name | select(startswith("risk:"))] | join(",")' <<< "$issue")"
