@@ -72,6 +72,14 @@ function testCase(snippet, variable, value) {
   return result.status === 0;
 }
 
+test('Task Contract drift is rejected before privileged publisher token', () => {
+  assert.match(preflight, /contract_hash=.*sha256sum/);
+  assert.match(validator, /current_contract_hash=.*sha256sum/);
+  assert.match(validator, /Task Contract changed; rerun preflight/);
+  const gate = publish.steps.find(s => s.name?.startsWith('Validate patch'));
+  assert.equal(gate.env.EXPECTED_CONTRACT_HASH, '${{ needs.preflight.outputs.contract_hash }}');
+});
+
 test('path guard rejects protected paths case-insensitively and accepts normal files', () => {
   const normalizeStart = validator.indexOf('p="$(printf');
   const caseStart = validator.indexOf('case "$p" in', normalizeStart);
