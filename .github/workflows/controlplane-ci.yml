@@ -28,6 +28,6 @@ jobs:
       - name: Actionlint — GitHub Actions syntax and expression validation
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -color
       - name: Validate YAML and executable trust-boundary tests
-        run: node --test tests/claude-builder-contract.test.cjs tests/claude-reviewer-contract.test.cjs
+        run: node --test tests/claude-builder-contract.test.cjs tests/claude-reviewer-contract.test.cjs tests/claude-repair-contract.test.cjs tests/claude-autonomy-contract.test.cjs
       - name: Fail-closed organization discovery tests
         run: node --test tools/repo-onboarding/audit.test.mjs tools/repo-onboarding/plan.test.mjs
