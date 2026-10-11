@@ -52,6 +52,13 @@ test('clean publisher validates untrusted patch before minting limited App token
   assert.equal(pub.steps[t].with['permission-pull-requests'],'write');
   assert.equal(pub.steps[t].with['permission-workflows'],undefined);
 });
+test('Repair invalidates stale Task Contract and retargeted PR base',()=>{
+  assert.match(gate,/contract_hash=.*sha256sum/);
+  assert.match(gate,/\.base\.ref == \$base/);
+  assert.match(guard,/Task Contract changed/);
+  assert.match(guard,/\.base\.ref == \$base/);
+  assert.ok(pub.steps.find(s=>s.name?.startsWith('Verify patch')).env.CONTRACT_HASH);
+});
 test('same PR fast-forward only, never merge or force',()=>{
   assert.match(push,/git push origin "HEAD:refs\/heads\/\$BRANCH"/);
   assert.doesNotMatch(push,/--force|gh pr merge|pulls\/.*\/merge/);
