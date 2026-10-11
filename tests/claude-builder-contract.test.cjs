@@ -72,6 +72,11 @@ function testCase(snippet, variable, value) {
   return result.status === 0;
 }
 
+test('all-repositories installation never executes Builder on central control-plane repo', () => {
+  assert.match(preflight, /test "\$GITHUB_REPOSITORY" != "nexagnet\/\.github"/);
+  assert.match(validator, /test "\$GITHUB_REPOSITORY" != "nexagnet\/\.github"/);
+});
+
 test('Task Contract drift is rejected before privileged publisher token', () => {
   assert.match(preflight, /contract_hash=.*sha256sum/);
   assert.match(validator, /current_contract_hash=.*sha256sum/);
@@ -133,7 +138,7 @@ test('preflight rejects invalid actor/event and missing/conflicting/R3 risk', ()
       .map(h => '## ' + h).join('\n');
     const validEvent = { action: 'created', issue: { number: 12 }, comment: { user: { login: 'phungtienviet14-sketch' }, body: '@claude' } };
     const validIssue = { state: 'open', labels: [{name:'risk:R1'}], body: headings };
-    function call(event, issue, actor = 'phungtienviet14-sketch') {
+    function call(event, issue, actor = 'phungtienviet14-sketch', repository = 'nexagnet/example') {
       writeFileSync(eventFile, JSON.stringify(event));
       writeFileSync(issueFile, JSON.stringify(issue));
       writeFileSync(outFile, '');
@@ -141,7 +146,7 @@ test('preflight rejects invalid actor/event and missing/conflicting/R3 risk', ()
         encoding: 'utf8',
         env: {
           ...process.env, PATH: bin + ':' + process.env.PATH,
-          GITHUB_REPOSITORY_OWNER: 'nexagnet', GITHUB_REPOSITORY: 'nexagnet/example',
+          GITHUB_REPOSITORY_OWNER: 'nexagnet', GITHUB_REPOSITORY: repository,
           GITHUB_EVENT_NAME: 'issue_comment', GITHUB_ACTOR: actor,
           GITHUB_EVENT_PATH: eventFile, GITHUB_OUTPUT: outFile, ISSUE_NUMBER: '12',
           MOCK_ISSUE: issueFile, GH_TOKEN: 'test-read-only-token'
@@ -156,6 +161,7 @@ test('preflight rejects invalid actor/event and missing/conflicting/R3 risk', ()
     assert.equal(call({...validEvent, action:'edited'}, validIssue), false);
     assert.equal(call({...validEvent, issue:{number:12, pull_request:{url:'x'}}}, validIssue), false);
     assert.equal(call(validEvent, validIssue, 'untrusted-user'), false);
+    assert.equal(call(validEvent, validIssue, 'phungtienviet14-sketch', 'nexagnet/.github'), false);
   } finally {
     rmSync(folder, { recursive: true, force: true });
   }
