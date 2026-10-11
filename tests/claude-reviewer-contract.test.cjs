@@ -59,6 +59,13 @@ test('deterministic preflight verifies exact-head CI, complete job set, issuer a
   assert.equal(jobs.gate.permissions['actions'], 'read');
 });
 
+test('only publisher bot PRs on issue-specific branch reach Reviewer', () => {
+  assert.match(preflight, /claude\/issue-/);
+  assert.match(preflight, /nexagnet-builder-publisher\[bot\]/);
+  assert.match(preflight, /head\.repo\.full_name == \$repo/);
+  assert.match(preflight, /issue_id/);
+});
+
 test('protected path gate includes workflow, automation and instruction file attacks', () => {
   const check = preflight.match(/jq -e 'all\(\.\[\];[\s\S]*?' <<< "\$files" >\/dev\/null/);
   assert.ok(check, 'Expected fail-closed protection applied to GitHub PR file listing');
