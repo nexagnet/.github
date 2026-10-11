@@ -107,6 +107,16 @@ jobs:
             jq -e --arg n "$name" '[.jobs[] |
               select(.name == $n and .status == "completed" and .conclusion == "success")] | length == 1' <<< "$jobs" >/dev/null
           done
+          # If branch rules cannot be read, no auto-merge authority is issued.
+          # Pending merge-queue entries could outlive a revoked opt-in label.
+          effective_rules="$(gh api "repos/$GITHUB_REPOSITORY/rules/branches/$EXPECTED_BASE?per_page=100")"
+          jq -e '
+            type == "array" and length > 0
+            and (all(.[]; .type != "merge_queue"))
+            and any(.[]; .type == "required_status_checks" or .type == "pull_request")
+          ' <<< "$effective_rules" >/dev/null || {
+            echo "::error::Missing verified protective rules or merge queue present"; exit 1;
+          }
           files="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files?per_page=100")"
           test "$(jq length <<< "$files")" -lt 100
           jq -e 'all(.[]; (.filename | ascii_downcase |
@@ -150,7 +160,7 @@ jobs:
             -f body="NEEDS_OWNER: R2 PR at exact HEAD $SHA. Human-controlled merge only; no auto-merge token used."
 
   merge:
-    name: Native auto-merge for opted-in R0/R1 only
+    name: Immediate risk-gated merge for opted-in R0/R1 only
     needs: decide
     if: needs.decide.outputs.decision == 'R0_R1_AUTO_MERGE'
     runs-on: ubuntu-24.04
@@ -231,7 +241,7 @@ jobs:
           repositories: ${{ github.event.repository.name }}
           permission-contents: write
           permission-pull-requests: write
-      - name: Mark ready and enable GitHub-native requirements-respecting auto-merge
+      - name: Mark ready and merge immediately only with current proof
         env:
           GH_TOKEN: ${{ steps.merge_token.outputs.token }}
           PR: ${{ inputs.pr_number }}
@@ -242,5 +252,6 @@ jobs:
           test "$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq .head.sha)" = "$SHA"
           gh pr ready "$PR" --repo "$GITHUB_REPOSITORY"
           test "$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq .head.sha)" = "$SHA"
-          gh pr merge "$PR" --auto --squash --match-head-commit "$SHA" --repo "$GITHUB_REPOSITORY"
-          echo "Auto-merge requested; this does NOT prove exact-main CI or runtime."
+          # Do not enqueue delayed auto-merge; it could outlive owner opt-in labels.
+          gh pr merge "$PR" --squash --match-head-commit "$SHA" --repo "$GITHUB_REPOSITORY"
+          echo "Immediate risk-gated merge requested; verify merge SHA and exact-main CI separately."
