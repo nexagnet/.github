@@ -13,8 +13,8 @@ Owner-controlled R3 implementation and merge; this runbook does not authorize pr
 - **R2:** NEEDS_OWNER comment, no merge token; owner manual merge only.
 - **R3:** BLOCK, never an Autopilot entry point.
 - A separate \`AUTONOMY_MERGE_APP_ID\` / \`AUTONOMY_MERGE_APP_PRIVATE_KEY\` installation with Contents R/W and Pull requests R/W is required. This merge authority is deliberately NOT the Builder Publisher App. App creation/installation and secrets remain OWNER R3 GATE.
-- Only after revalidating SHA, risk and labels does the merge job mint the token. It marks Draft PR ready and calls GitHub CLI native \`gh pr merge --auto --squash --match-head-commit SHA\`, without \`--admin\` or branch-rule bypass.
-- Native auto-merge requires repository auto-merge enabled, supported plan and meaningful branch protection rules. The workflow will fail closed if missing. GitHub may merge later, so success of the call is NOT proof of merge, exact-main CI, deploy or runtime.
+- Only after revalidating SHA, risk and labels does the merge job mint the token. It marks Draft PR ready and calls GitHub CLI native \`gh pr merge --squash --match-head-commit SHA\` **immediately**, without \`--admin\` or branch-rule bypass. Delayed \`--auto\` is FORBIDDEN: an opt-in label might be revoked while the merge is pending.
+- The pre-merge gate fetches **effective rules for the target branch**, fails if rules are unavailable/empty, requires status-check or PR protections, and rejects any merge-queue rule. GitHub's immediate merge must fail if current requirements are not satisfied. Because no delayed merge is scheduled, opt-in label revocation after a prior run cannot trigger a future merge request. Success of the CLI call is NOT proof of merge SHA, exact-main CI, deploy or runtime; independently re-fetch.
 - Merge receipt must be independently verified live; after actual merge, check merge SHA and exact-main CI and required runtime proof. A separate watchdog/coordinator can track that.
 - Do not enable this on a consumer where V4 Autonomy is still evaluating the same PR, to prevent competing merge engines.
 
