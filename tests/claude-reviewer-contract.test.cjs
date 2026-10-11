@@ -89,6 +89,18 @@ test('trusted reporter rechecks PR HEAD, Issue risk and CI run after Claude', ()
   assert.doesNotMatch(reporter, /gh pr merge|git push|repository_dispatch/);
 });
 
+test('Reviewer creates trusted run-scoped structured evidence only after revalidation', () => {
+  const reporter = jobs.report;
+  assert.ok(reporter.steps[0].run.includes('review-evidence.json'));
+  assert.match(reporter.steps[0].run, /nexagnet-review-v1/);
+  assert.match(reporter.steps[0].run, /ci_run_id/);
+  const artifact = reporter.steps.find(s => s.name?.startsWith('Upload exact-head reviewer evidence'));
+  assert.ok(artifact);
+  assert.equal(artifact.with.name,'nexagnet-review-evidence');
+  assert.equal(artifact.with['if-no-files-found'],'error');
+  assert.equal(artifact.with['retention-days'],14);
+});
+
 test('every external action is pinned to 40-character immutable SHA', () => {
   const actions = [...source.matchAll(/uses: ([^\s]+)@([^\s]+)/g)];
   assert.ok(actions.length >= 2);
