@@ -170,13 +170,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ inputs.pr_number }}
           SHA: ${{ needs.gate.outputs.head }}
-          ISSUE: ${{ needs.gate.outputs.issue }}
+          TASK_ID: ${{ needs.gate.outputs.issue }}
           RISK: ${{ needs.gate.outputs.risk }}
           RUN: ${{ inputs.ci_run_id }}
           RESULT: ${{ needs.review.outputs.result }}
         run: |
-          # shellcheck disable=SC2153
-          set -euo pipefail
+                    set -euo pipefail
           test "$GITHUB_REPOSITORY_OWNER" = nexagnet
           test "$GITHUB_REPOSITORY" != nexagnet/.github
           test -n "$RESULT"
@@ -206,6 +205,6 @@ jobs:
           findings="$(jq -r '[.findings[] |
             "- \(.severity): \(.path):\(.line) - \(.message)"] | join("\n")' <<< "$RESULT")"
           msg="$(printf 'NEXAGNET_REVIEWER %s\nHEAD_SHA: %s\nCI_RUN: %s\nISSUE: #%s\nRISK: R%s\n\n%s\n%s\n\nNot merge authorization.\n' \
-            "$verdict" "$SHA" "$RUN" "$ISSUE" "$RISK" "$summary" "$findings")"
+            "$verdict" "$SHA" "$RUN" "$TASK_ID" "$RISK" "$summary" "$findings")"
           jq -n --arg body "$msg" '{body:$body}' |
             gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --input - --jq .html_url
