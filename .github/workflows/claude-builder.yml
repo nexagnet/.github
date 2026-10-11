@@ -31,6 +31,7 @@ jobs:
       base_sha: ${{ steps.gate.outputs.base_sha }}
       base_branch: ${{ steps.gate.outputs.base_branch }}
       risk: ${{ steps.gate.outputs.risk }}
+      contract_hash: ${{ steps.gate.outputs.contract_hash }}
     steps:
       - id: gate
         env:
@@ -68,6 +69,7 @@ jobs:
           base_sha="$(gh api "repos/$GITHUB_REPOSITORY/branches/$base_branch" --jq .commit.sha)"
           [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]]
           {
+            echo "contract_hash=$(printf '%s' "$contract" | sha256sum | awk '{print $1}')"
             echo "risk=$(printf '%s' "$risk" | cut -d: -f2)"
             echo "base_sha=$base_sha"
             echo "base_branch=$base_branch"
@@ -168,6 +170,7 @@ jobs:
           BASE_BRANCH: ${{ needs.preflight.outputs.base_branch }}
           BASE_SHA: ${{ needs.preflight.outputs.base_sha }}
           EXPECTED_RISK: ${{ needs.preflight.outputs.risk }}
+          EXPECTED_CONTRACT_HASH: ${{ needs.preflight.outputs.contract_hash }}
           PATCH: ${{ runner.temp }}/untrusted/proposed.patch
         run: |
           set -euo pipefail
@@ -183,6 +186,11 @@ jobs:
           jq -e '.state == "open" and (has("pull_request") | not)' <<< "$issue" >/dev/null
           risk="$(jq -r '[.labels[].name | select(startswith("risk:"))] | join(",")' <<< "$issue")"
           test "$risk" = "risk:$EXPECTED_RISK"
+          contract="$(jq -r '.body // ""' <<< "$issue")"
+          current_contract_hash="$(printf '%s' "$contract" | sha256sum | awk '{print $1}')"
+          test "$current_contract_hash" = "$EXPECTED_CONTRACT_HASH" || {
+            echo "::error::Task Contract changed; rerun preflight"; exit 1;
+          }
           # Artifact is untrusted. NEVER execute code from its contents.
           git apply --check --index "$PATCH"
           git apply --index "$PATCH"
