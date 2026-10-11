@@ -37,6 +37,7 @@ jobs:
       reviewer_run: ${{ steps.policy.outputs.reviewer_run }}
       contract_hash: ${{ steps.policy.outputs.contract_hash }}
       base: ${{ steps.policy.outputs.base }}
+      branch: ${{ steps.policy.outputs.branch }}
     steps:
       - id: policy
         env:
@@ -124,6 +125,7 @@ jobs:
             echo "reviewer_run=$REVIEW_RUN"
             echo "contract_hash=$(jq -r '.body // ""' <<< "$issue" | sha256sum | awk '{print $1}')"
             echo "base=$base"
+            echo "branch=$branch"
             echo "decision=$decision"
             echo "sha=$SHA"
             echo "issue=$task"
@@ -171,6 +173,7 @@ jobs:
           REVIEW_RUN: ${{ needs.decide.outputs.reviewer_run }}
           CONTRACT_HASH: ${{ needs.decide.outputs.contract_hash }}
           EXPECTED_BASE: ${{ needs.decide.outputs.base }}
+          EXPECTED_BRANCH: ${{ needs.decide.outputs.branch }}
           REQUIRED: ${{ inputs.required_jobs_csv }}
         shell: bash
         run: |
@@ -178,8 +181,9 @@ jobs:
           test "$GITHUB_REPOSITORY_OWNER" = nexagnet
           test "$GITHUB_REPOSITORY" != nexagnet/.github
           pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR")"
-          jq -e --arg sha "$SHA" --arg base "$EXPECTED_BASE" --arg repo "$GITHUB_REPOSITORY" '
+          jq -e --arg sha "$SHA" --arg base "$EXPECTED_BASE" --arg branch "$EXPECTED_BRANCH" --arg repo "$GITHUB_REPOSITORY" '
             .state == "open" and .head.sha == $sha and .base.ref == $base
+            and .head.ref == $branch
             and .head.repo.full_name == $repo and .base.repo.full_name == $repo
             and .user.login == "nexagnet-builder-publisher[bot]"
           ' <<< "$pr" >/dev/null
@@ -222,7 +226,7 @@ jobs:
           # Pending merge-queue entries could outlive a revoked opt-in label.
           effective_rules="$(gh api "repos/$GITHUB_REPOSITORY/rules/branches/$EXPECTED_BASE?per_page=100")"
           jq -e '
-            type == "array" and length > 0
+            type == "array" and length > 0 and length < 100
             and (all(.[]; .type != "merge_queue"))
             and any(.[]; .type == "required_status_checks" or .type == "pull_request")
           ' <<< "$effective_rules" >/dev/null || {
