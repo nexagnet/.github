@@ -122,3 +122,16 @@ test('Independent Reviewer bootstraps bubblewrap before the scrubbed Claude acti
   assert.ok(!/CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=0/.test(source));
   assert.equal(install.env?.CLAUDE_CODE_OAUTH_TOKEN, undefined);
 });
+
+test('official Claude Reviewer action allowlists only the trusted Publisher bot actor', () => {
+  assert.equal(reviewer.with.allowed_bots, 'nexagnet-builder-publisher[bot]');
+  assert.notEqual(reviewer.with.allowed_bots, '*');
+  assert.equal(reviewer.with.allowed_non_write_users, undefined);
+  assert.ok(preflight.includes('nexagnet-builder-publisher[bot]'));
+  assert.ok(preflight.includes('.user.type == "Bot"'));
+  assert.ok(preflight.includes('.head.sha == $sha'));
+  assert.equal(jobs.review.permissions.contents, 'read');
+  assert.equal(jobs.review.permissions['pull-requests'], 'read');
+  assert.equal(jobs.review.permissions['id-token'], undefined);
+  assert.ok(!JSON.stringify(jobs.review).includes('BUILDER_PUBLISHER_APP_PRIVATE_KEY'));
+});
