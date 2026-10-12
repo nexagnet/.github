@@ -38,7 +38,8 @@ test('reviewer is an independent non-writing agent with exact SHA', () => {
   assert.equal(checkout.with.ref, '\${{ needs.gate.outputs.head }}');
   assert.equal(reviewer.with.github_token, '\${{ github.token }}');
   assert.match(reviewer.with.claude_args, /--json-schema/);
-  assert.match(reviewer.with.claude_args, /--disallowedTools "Edit,Write,/);
+  assert.match(reviewer.with.claude_args, /--allowedTools "Read,Glob,Grep"/);
+  assert.match(reviewer.with.claude_args, /--disallowedTools "Bash,Edit,Write,/);
   assert.equal(reviewer.with.show_full_output, 'false');
   assert.ok(!JSON.stringify(jobs.review).includes('BUILDER_PUBLISHER_APP_PRIVATE_KEY'));
 });
@@ -78,8 +79,10 @@ test('protected path gate includes workflow, automation and instruction file att
 test('trusted reporter rechecks PR HEAD, Issue risk and CI run after Claude', () => {
   assert.deepEqual(jobs.report.needs, ['gate','review']);
   assert.equal(jobs.report.permissions.contents, 'read');
-  assert.equal(jobs.report.permissions.issues, 'write');
-  assert.equal(jobs.report.permissions['pull-requests'], 'read');
+  assert.equal(jobs.report.permissions.issues, 'read');
+  assert.equal(jobs.report.permissions['pull-requests'], 'write');
+  assert.equal(jobs.report.permissions['id-token'], undefined);
+  assert.equal(jobs.report.permissions.contents, 'read');
   assert.equal(jobs.report.permissions['id-token'], undefined);
   assert.match(reporter, /\.head\.sha == \$sha/);
   assert.match(reporter, /\.head_sha == \$sha/);
@@ -133,5 +136,47 @@ test('official Claude Reviewer action allowlists only the trusted Publisher bot 
   assert.equal(jobs.review.permissions.contents, 'read');
   assert.equal(jobs.review.permissions['pull-requests'], 'read');
   assert.equal(jobs.review.permissions['id-token'], undefined);
+  assert.ok(!JSON.stringify(jobs.review).includes('BUILDER_PUBLISHER_APP_PRIVATE_KEY'));
+});
+
+test('trusted Reviewer prepares bounded exact-base-to-head diff before Claude without sandbox Bash', () => {
+  assert.equal(jobs.gate.outputs.base_sha, '${{ steps.verify.outputs.base_sha }}');
+  assert.ok(preflight.includes('base_sha="$(jq -r .base.sha <<< "$pr")"'));
+  assert.ok(preflight.includes('echo "base_sha=$base_sha"'));
+  const steps = jobs.review.steps;
+  const diff = steps.find(x => x.name === 'Prepare bounded trusted PR diff for read-only Claude');
+  assert.ok(diff, 'trusted diff generator step must exist');
+  assert.ok(steps.indexOf(diff) < steps.indexOf(steps.find(x => x.id === 'claude')));
+  assert.equal(diff.env.BASE, '${{ needs.gate.outputs.base_sha }}');
+  assert.equal(diff.env.HEAD_SHA, '${{ needs.gate.outputs.head }}');
+  assert.match(diff.run, /test "\$\(git rev-parse HEAD\)" = "\$HEAD_SHA"/);
+  assert.ok(diff.run.includes('git cat-file -e "${BASE}^{commit}"'));
+  assert.ok(diff.run.includes('git diff --no-ext-diff --no-textconv "$BASE...$HEAD_SHA" --'));
+  assert.ok(diff.run.includes('> "$RUNNER_TEMP/reviewer-pr-diff.patch"'));
+  assert.ok(diff.run.includes('test -s "$RUNNER_TEMP/reviewer-pr-diff.patch"'));
+  assert.ok(diff.run.includes('-le 500000'));
+  assert.ok(reviewer.with.prompt.includes('reviewer-pr-diff.patch'));
+  assert.ok(reviewer.with.prompt.includes('UNTRUSTED data'));
+  assert.ok(reviewer.with.prompt.includes('diff_inspected=false'));
+  assert.doesNotMatch(reviewer.with.claude_args, /Bash\(git /);
+  assert.match(reviewer.with.claude_args, /--disallowedTools "Bash,/);
+  assert.match(reviewer.with.claude_args, /"diff_inspected":\{"type":"boolean"\}/);
+});
+
+test('trusted Reporter is the only PR-comment writer and enforces diff inspection', () => {
+  const run = jobs.report.steps[0].run;
+  assert.equal(jobs.gate.permissions['pull-requests'], 'read');
+  assert.equal(jobs.review.permissions['pull-requests'], 'read');
+  assert.equal(jobs.report.permissions['pull-requests'], 'write');
+  assert.equal(jobs.report.permissions.issues, 'read');
+  assert.equal(jobs.report.permissions.contents, 'read');
+  assert.equal(jobs.report.permissions['id-token'], undefined);
+  assert.match(run, /\.diff_inspected \| type == "boolean"/);
+  assert.match(run, /\.verdict == "PASS" then \.diff_inspected == true/);
+  const artifactIndex = run.indexOf('> "$RUNNER_TEMP/review-evidence.json"');
+  const commentIndex = run.indexOf('gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments"');
+  assert.ok(artifactIndex >= 0 && commentIndex > artifactIndex, 'evidence assembled before publishing');
+  assert.match(run, /jq -e --arg sha "\$SHA"/);
+  assert.doesNotMatch(run, /gh pr merge|git push|repository_dispatch/);
   assert.ok(!JSON.stringify(jobs.review).includes('BUILDER_PUBLISHER_APP_PRIVATE_KEY'));
 });
