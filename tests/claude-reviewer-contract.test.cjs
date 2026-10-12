@@ -83,7 +83,6 @@ test('trusted reporter rechecks PR HEAD, Issue risk and CI run after Claude', ()
   assert.equal(jobs.report.permissions['pull-requests'], 'write');
   assert.equal(jobs.report.permissions['id-token'], undefined);
   assert.equal(jobs.report.permissions.contents, 'read');
-  assert.equal(jobs.report.permissions['id-token'], undefined);
   assert.match(reporter, /\.head\.sha == \$sha/);
   assert.match(reporter, /\.head_sha == \$sha/);
   assert.match(reporter, /risk:\$RISK/);
