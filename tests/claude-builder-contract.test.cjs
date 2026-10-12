@@ -178,3 +178,29 @@ test('preflight rejects invalid actor/event and missing/conflicting/R3 risk', ()
     rmSync(folder, { recursive: true, force: true });
   }
 });
+
+test('Claude Builder bootstraps bubblewrap before action without disabling env isolation', () => {
+  assert.equal(agent.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, '1');
+  const install = agent.steps.find(s => s.name === 'Install bubblewrap for isolated Claude subprocesses');
+  const claude = agent.steps.find(s => s.name?.startsWith('Claude proposes LOCAL'));
+  assert.ok(install && claude, 'install and Claude steps must exist');
+  assert.ok(agent.steps.indexOf(install) < agent.steps.indexOf(claude));
+  assert.match(install.run, /set -euo pipefail/);
+  assert.match(install.run, /sudo apt-get install -y --no-install-recommends bubblewrap/);
+  assert.match(install.run, /command -v bwrap/);
+  assert.match(install.run, /bwrap --version/);
+  assert.ok(!/CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=0/.test(source));
+  assert.equal(install.env?.CLAUDE_CODE_OAUTH_TOKEN, undefined);
+});
+
+test('Central control-plane CI verifies the real PR HEAD or pushed main commit', () => {
+  const ci = readFileSync(resolve(__dirname, '../.github/workflows/controlplane-ci.yml'), 'utf8');
+  assert.ok(ci.includes('EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}'));
+  assert.ok(ci.includes('ref: ${{ env.EXPECTED_SHA }}'));
+  assert.ok(ci.includes('persist-credentials: false'));
+  assert.ok(ci.includes('actual="$(git rev-parse HEAD)"'));
+  assert.ok(ci.includes('test "${actual}" = "${EXPECTED_SHA}"'));
+  assert.ok(ci.includes('expected=${EXPECTED_SHA} actual=${actual}'));
+  assert.ok(ci.includes('go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7'));
+  assert.ok(ci.includes('node --test tests/claude-builder-contract.test.cjs tests/claude-reviewer-contract.test.cjs'));
+});

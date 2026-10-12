@@ -21,10 +21,20 @@ jobs:
     name: Central workflow contract
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    env:
+      EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ env.EXPECTED_SHA }}
           persist-credentials: false
+      - name: Assert exact PR HEAD or pushed main SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          echo "expected=${EXPECTED_SHA} actual=${actual}"
+          test "${actual}" = "${EXPECTED_SHA}"
       - name: Actionlint — GitHub Actions syntax and expression validation
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -color
       - name: Validate YAML and executable trust-boundary tests
