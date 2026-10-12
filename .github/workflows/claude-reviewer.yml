@@ -137,6 +137,14 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$SHA"
           printf '%s' "$CONTRACT" | base64 -d > "$RUNNER_TEMP/task-contract.md"
+      - name: Install bubblewrap for isolated Claude subprocesses
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends bubblewrap
+          command -v bwrap
+          bwrap --version
       - id: claude
         name: Claude Code independent read-only review
         uses: anthropics/claude-code-action@6fed3ca145920b639991cb756090506e1bcaf515 # v1
