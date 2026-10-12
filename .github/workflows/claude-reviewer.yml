@@ -152,6 +152,10 @@ jobs:
           CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '1'
         with:
           github_token: ${{ github.token }}
+          # workflow_run actor is the trusted Publisher bot. Preflight first
+          # verifies exact-head CI and this bot's PR ownership/branch.
+          # Official Claude Code Action otherwise rejects all bot actors.
+          allowed_bots: 'nexagnet-builder-publisher[bot]'
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           show_full_output: 'false'
           prompt: |
