@@ -108,3 +108,17 @@ test('every external action is pinned to 40-character immutable SHA', () => {
     assert.match(sha, /^[0-9a-f]{40}$/, name);
   }
 });
+
+test('Independent Reviewer bootstraps bubblewrap before the scrubbed Claude action', () => {
+  const review = jobs.review;
+  const install = review.steps.find(s => s.name === 'Install bubblewrap for isolated Claude subprocesses');
+  assert.ok(install, 'bubblewrap prerequisite is required');
+  assert.ok(review.steps.indexOf(install) < review.steps.indexOf(reviewer));
+  assert.match(install.run, /set -euo pipefail/);
+  assert.match(install.run, /sudo apt-get install -y --no-install-recommends bubblewrap/);
+  assert.match(install.run, /command -v bwrap/);
+  assert.match(install.run, /bwrap --version/);
+  assert.equal(reviewer.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, '1');
+  assert.ok(!/CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=0/.test(source));
+  assert.equal(install.env?.CLAUDE_CODE_OAUTH_TOKEN, undefined);
+});
