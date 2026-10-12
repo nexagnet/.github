@@ -178,3 +178,17 @@ test('preflight rejects invalid actor/event and missing/conflicting/R3 risk', ()
     rmSync(folder, { recursive: true, force: true });
   }
 });
+
+test('Claude Builder bootstraps bubblewrap before action without disabling env isolation', () => {
+  assert.equal(agent.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, '1');
+  const install = agent.steps.find(s => s.name === 'Install bubblewrap for isolated Claude subprocesses');
+  const claude = agent.steps.find(s => s.name?.startsWith('Claude proposes LOCAL'));
+  assert.ok(install && claude, 'install and Claude steps must exist');
+  assert.ok(agent.steps.indexOf(install) < agent.steps.indexOf(claude));
+  assert.match(install.run, /set -euo pipefail/);
+  assert.match(install.run, /sudo apt-get install -y --no-install-recommends bubblewrap/);
+  assert.match(install.run, /command -v bwrap/);
+  assert.match(install.run, /bwrap --version/);
+  assert.ok(!/CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=0/.test(source));
+  assert.equal(install.env?.CLAUDE_CODE_OAUTH_TOKEN, undefined);
+});
