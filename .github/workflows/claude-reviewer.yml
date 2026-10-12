@@ -151,7 +151,7 @@ jobs:
           [[ "$BASE" =~ ^[0-9a-f]{40}$ && "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$(git rev-parse HEAD)" = "$HEAD_SHA"
           git cat-file -e "${BASE}^{commit}"
-          git diff --no-ext-diff --no-textconv "$BASE...$HEAD_SHA" --             > "$RUNNER_TEMP/reviewer-pr-diff.patch"
+          git diff --no-ext-diff --no-textconv "$BASE...$HEAD_SHA" -- > "$RUNNER_TEMP/reviewer-pr-diff.patch"
           test -s "$RUNNER_TEMP/reviewer-pr-diff.patch"
           test "$(wc -c < "$RUNNER_TEMP/reviewer-pr-diff.patch")" -le 500000
       - name: Install bubblewrap for isolated Claude subprocesses
