@@ -268,3 +268,59 @@ test('Agent failing to produce a patch reports fail-closed classification', () =
   assert.match(patch.run, /git diff --cached --quiet/);
   assert.ok(agent.steps.indexOf(diagnostic) < agent.steps.indexOf(patch));
 });
+
+
+test('Builder emits bounded structured status instead of silent model success', () => {
+  const claude = agent.steps.find(s => s.id === 'claude');
+  const status = agent.steps.find(s => s.name?.startsWith('Validate bounded agent status'));
+  const patch = agent.steps.find(s => s.name?.startsWith('Produce UNTRUSTED patch'));
+  assert.ok(claude && status && patch);
+  assert.ok(agent.steps.indexOf(claude) < agent.steps.indexOf(status));
+  assert.ok(agent.steps.indexOf(status) < agent.steps.indexOf(patch));
+  const match = claude.with.claude_args.match(/--json-schema '([^']+)'/);
+  assert.ok(match, 'agent must return structured diagnostic schema');
+  const schema = JSON.parse(match[1]);
+  assert.equal(schema.type, 'object');
+  assert.equal(schema.additionalProperties, false);
+  assert.deepEqual(schema.properties.status.enum, ['APPLIED', 'BLOCKED']);
+  assert.ok(schema.properties.blocker_code.enum.includes('SANDBOX_UNAVAILABLE'));
+  assert.ok(schema.properties.blocker_code.enum.includes('UNREADABLE_CONTRACT'));
+  assert.equal(schema.properties.summary.maxLength, 500);
+  assert.equal(schema.properties.local_checks_attempted.type, 'boolean');
+  assert.equal(status.env.STRUCTURED, '$' + '{{ steps.claude.outputs.structured_output }}');
+  assert.match(claude.with.prompt, /do not forbid preparing local/);
+  assert.match(claude.with.prompt, /do not invent file changes/);
+  assert.match(status.run, /BUILDER_STATUS_MISSING/);
+  assert.match(status.run, /BUILDER_BLOCKED/);
+  assert.doesNotMatch(status.run, /jq -r .summary|echo "\$STRUCTURED"|cat.*claude-execution/);
+  assert.match(patch.run, /git diff --cached --quiet/);
+  assert.equal(claude.with.show_full_output, 'false');
+});
+
+test('structured status validator fails closed on missing, malformed, inconsistent or blocked response', () => {
+  const step = agent.steps.find(s => s.name?.startsWith('Validate bounded agent status'));
+  const folder = mkdtempSync(join(tmpdir(), 'nexagnet-v5-status-'));
+  try {
+    const summary = join(folder, 'summary');
+    function check(value) {
+      writeFileSync(summary, '');
+      const obj = typeof value === 'string' ? value : JSON.stringify(value);
+      return spawnSync('bash', ['-c', step.run], {
+        env: { ...process.env, STRUCTURED: obj, GITHUB_STEP_SUMMARY: summary },
+        encoding: 'utf8',
+      }).status === 0;
+    }
+    const applied = {status:'APPLIED',blocker_code:'NONE',summary:'Changed docs',local_checks_attempted:true};
+    assert.equal(check(applied), true);
+    assert.equal(check({...applied,status:'BLOCKED'}), false);
+    assert.equal(check({...applied,status:'BLOCKED',blocker_code:'SANDBOX_UNAVAILABLE'}), false);
+    assert.equal(check({...applied,blocker_code:'NETWORK_REQUIRED'}), false);
+    assert.equal(check({...applied,summary:'x'.repeat(501)}), false);
+    assert.equal(check({...applied,local_checks_attempted:'true'}), false);
+    assert.equal(check(''), false);
+    assert.equal(check('{bad'), false);
+    assert.equal(check({status:'APPLIED'}), false);
+  } finally {
+    rmSync(folder, { recursive: true, force: true });
+  }
+});
