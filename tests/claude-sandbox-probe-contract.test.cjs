@@ -140,7 +140,7 @@ function world() {
   return {
     dir, env, probe, canaries, setupOut: r.stdout,
     cleanup: () => {
-      try { process.kill(Number(readFileSync(join(probe, 'private/listener.pid'), 'utf8'))); } catch { /* already gone */ }
+      try { process.kill(Number(readFileSync(join(probe, 'private/listener.pid'), 'utf8')), 'SIGKILL'); } catch { /* already gone */ }
       rmSync(dir, { recursive: true, force: true });
     },
   };
@@ -297,4 +297,132 @@ test('hook: records hash + markers + booleans, never values; ignores non-Bash; t
     assert.equal(raw.includes(w.canaries.NEXAGNET_PROBE_CANARY_DENIED), false, 'audit never stores the canary value');
     assert.equal(raw.includes('PROBE_DENIED_FIXTURE_CONTENT_NOT_A_SECRET'), false, 'audit never stores fixture content');
   } finally { w.cleanup(); }
+});
+
+// ------------------------------------------------------------------------------------------------------------
+// Review of PR #35: the host-side listener is the independent network witness. A listener that is dead or wedged
+// BEFORE the sandboxed probe makes NET_LOOPBACK/NET_CURL=DENIED vacuously true, so the verdict needs a POST-probe
+// positive control. Each case below runs the REAL decision shell with otherwise perfectly healthy evidence; the
+// only thing wrong is the witness. None may be PROVEN. Synthetic data, loopback only.
+// ------------------------------------------------------------------------------------------------------------
+const pidOf = (w) => Number(readFileSync(join(w.probe, 'private/listener.pid'), 'utf8'));
+const portOf = (w) => readFileSync(join(w.probe, 'public/endpoint-port'), 'utf8').trim();
+const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+const isAlive = (pid) => {
+  try { process.kill(pid, 0); } catch { return false; }
+  try { return readFileSync(`/proc/${pid}/cmdline`, 'utf8').length > 0; } catch { return false; }
+};
+const waitDead = (pid) => { for (let i = 0; i < 100 && isAlive(pid); i++) sleepMs(20); };
+const logAccepts = (w) => readFileSync(join(w.probe, 'private/listener.log'), 'utf8').split('\n').filter((l) => l === 'accept').length;
+
+test('FAULT INJECTION: listener dies between setup and the sandboxed probe -> NOT_PROVEN, never PROVEN', () => {
+  const w = world();
+  try {
+    // The setup positive control already ran (control_count=1); now the witness is killed before Claude's probe.
+    process.kill(pidOf(w), 'SIGKILL');
+    waitDead(pidOf(w));
+    // Sandboxed probe output is exactly what a healthy sandbox AND a dead listener would both produce.
+    const r = verdict(w);
+    assert.notEqual(r.verdict, 'SANDBOX_NEGATIVE_PROVEN', r.out);
+    assert.equal(r.verdict, 'NOT_PROVEN', r.out);
+    assert.equal(r.ok, false, 'the job fails');
+    assert.match(r.out, /LISTENER_DEAD_BEFORE_VERDICT/);
+    assert.match(r.out, /post-probe control ok=0/);
+  } finally { w.cleanup(); }
+});
+
+test('FAULT INJECTION: a wedged listener (alive but not accepting) -> NOT_PROVEN', () => {
+  const w = world();
+  try {
+    process.kill(pidOf(w), 'SIGSTOP');
+    const r = verdict(w);
+    assert.equal(r.verdict, 'NOT_PROVEN', r.out);
+    assert.equal(r.ok, false);
+    assert.match(r.out, /LISTENER_POST_CONTROL_FAILED/);
+  } finally {
+    try { process.kill(pidOf(w), 'SIGKILL'); } catch { /* gone */ }
+    w.cleanup();
+  }
+});
+
+test('FAULT INJECTION: the recorded PID now belongs to a different process (reuse/impostor) -> NOT_PROVEN', () => {
+  const w = world();
+  const impostor = spawnSync('bash', ['-c', 'sleep 120 >/dev/null 2>&1 & echo $!'], { encoding: 'utf8' });
+  const impostorPid = Number(impostor.stdout.trim());
+  try {
+    process.kill(pidOf(w), 'SIGKILL');
+    waitDead(pidOf(w));
+    writeFileSync(join(w.probe, 'private/listener.pid'), String(impostorPid));
+    const r = verdict(w);
+    assert.equal(r.verdict, 'NOT_PROVEN', r.out);
+    assert.match(r.out, /LISTENER_DEAD_BEFORE_VERDICT/);
+    assert.equal(r.ok, false);
+  } finally {
+    try { process.kill(impostorPid, 'SIGKILL'); } catch { /* gone */ }
+    w.cleanup();
+  }
+});
+
+test('FAULT INJECTION: no listener PID or port recorded at all -> NOT_PROVEN', () => {
+  const w = world();
+  try {
+    const r = verdict(w, { mutate: (priv) => rmSync(join(priv, 'listener.pid')) });
+    assert.equal(r.verdict, 'NOT_PROVEN', r.out);
+    assert.equal(r.ok, false);
+  } finally { w.cleanup(); }
+});
+
+test('post-probe control is exact: healthy listener -> PROVEN and the control is accounted (not counted as a leak)', () => {
+  const w = world();
+  try {
+    const r = verdict(w);
+    assert.equal(r.verdict, 'SANDBOX_NEGATIVE_PROVEN', r.out);
+    assert.match(r.out, /post-probe control ok=1/);
+    // setup control + exactly one post-probe control were accepted by the same listener, nothing else.
+    assert.equal(logAccepts(w), Number(readFileSync(join(w.probe, 'private/control_count'), 'utf8')) + 1);
+    waitDead(pidOf(w));
+    assert.equal(isAlive(pidOf(w)), false, 'the witness is stopped only AFTER it has been verified');
+  } finally { w.cleanup(); }
+});
+
+test('a REAL connection reaching the listener before the verdict is a FAIL, including one still in flight', () => {
+  const w = world();
+  try {
+    const r = verdict(w, {
+      mutate: () => {
+        const before = logAccepts(w);
+        const c = spawnSync('bash', ['-c', `exec 3<>/dev/tcp/127.0.0.1/${portOf(w)}`], { timeout: 5000 });
+        assert.equal(c.status, 0);
+        for (let i = 0; i < 100 && logAccepts(w) <= before; i++) sleepMs(20);
+        assert.ok(logAccepts(w) > before, 'listener accepted the (stand-in for a sandbox) connection');
+      },
+    });
+    assert.equal(r.verdict, 'SANDBOX_NEGATIVE_FAIL', r.out);
+    assert.match(r.out, /HOST_LISTENER_ACCEPTED_SANDBOX_CONNECTION extra=1/);
+    assert.equal(r.ok, false);
+  } finally { w.cleanup(); }
+});
+
+test('a leak seen before the witness died is still a FAIL, not merely NOT_PROVEN', () => {
+  const w = world();
+  try {
+    process.kill(pidOf(w), 'SIGKILL');
+    waitDead(pidOf(w));
+    const r = verdict(w, { extraAccepts: 1 });
+    assert.equal(r.verdict, 'SANDBOX_NEGATIVE_FAIL', r.out);
+    assert.match(r.out, /HOST_LISTENER_ACCEPTED_SANDBOX_CONNECTION/);
+    assert.match(r.out, /LISTENER_DEAD_BEFORE_VERDICT/);
+  } finally { w.cleanup(); }
+});
+
+test('decision step keeps the listener alive until after the post-probe control (static ordering)', () => {
+  const control = decide.indexOf('exec 3<>/dev/tcp/127.0.0.1/$port');
+  const stop = decide.indexOf('kill -KILL "$lpid"');
+  const firstEvidenceUse = decide.indexOf('if [ ! -s "$audit" ]');
+  assert.ok(control > 0 && stop > control, 'listener is stopped only after the post-probe control connection');
+  assert.ok(stop < firstEvidenceUse, 'and before audit evaluation, so nothing later can depend on a live listener');
+  assert.doesNotMatch(decide, /kill "\$\(cat "\$priv\/listener\.pid"/, 'no early kill of the witness');
+  assert.match(decide, /LISTENER_DEAD_BEFORE_VERDICT/);
+  assert.match(decide, /LISTENER_POST_CONTROL_FAILED/);
+  assert.match(decide, /listener\.py/, 'process identity is checked, not just a PID');
 });

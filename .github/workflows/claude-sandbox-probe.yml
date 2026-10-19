@@ -271,16 +271,53 @@ jobs:
           probe="$RUNNER_TEMP/probe"
           priv="$probe/private"
           audit="$priv/audit.jsonl"
-          kill "$(cat "$priv/listener.pid" 2>/dev/null)" 2>/dev/null || true
           fail=()
           unproven=()
           pre=0
           post=0
           expected="$(cat "$priv/expected_cmd_sha" 2>/dev/null || true)"
           control="$(cat "$priv/control_count" 2>/dev/null || echo 0)"
-          accepts="$(grep -c '^accept$' "$priv/listener.log" 2>/dev/null || true)"
-          [[ "${accepts:-}" =~ ^[0-9]+$ ]] || accepts=0
           [[ "$control" =~ ^[0-9]+$ ]] || control=0
+          port="$(cat "$probe/public/endpoint-port" 2>/dev/null || true)"
+          lpid="$(cat "$priv/listener.pid" 2>/dev/null || true)"
+          count_accepts() {
+            local n
+            n="$(grep -c '^accept$' "$priv/listener.log" 2>/dev/null || true)"
+            [[ "${n:-}" =~ ^[0-9]+$ ]] || n=0
+            echo "$n"
+          }
+          # Accept count once it stops changing, so a sandbox connection still in flight is counted, not missed.
+          settled_accepts() {
+            local prev cur i
+            prev="$(count_accepts)"
+            for i in $(seq 1 12); do
+              sleep 0.25
+              cur="$(count_accepts)"
+              if [ "$cur" = "$prev" ]; then break; fi
+              prev="$cur"
+            done
+            echo "$prev"
+          }
+          # The host listener is the independent network witness. Do NOT stop it before it has been verified alive:
+          # a listener that died (or wedged) before the Claude Bash probe would make "denied" vacuously true.
+          # Post-probe positive control, from OUTSIDE the sandbox, after Claude finished: the same listener process
+          # must still exist and must accept exactly one new connection.
+          listener_alive=0
+          if [[ "$lpid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$lpid" 2>/dev/null \
+             && grep -q 'listener.py' "/proc/$lpid/cmdline" 2>/dev/null; then
+            listener_alive=1
+          fi
+          before="$(settled_accepts)"
+          post_ok=0
+          if [ "$listener_alive" = 1 ] && [[ "$port" =~ ^[1-9][0-9]*$ ]] \
+             && timeout 3 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" 2> /dev/null; then
+            for _ in $(seq 1 20); do
+              if [ "$(count_accepts)" -ge $((before + 1)) ]; then post_ok=1; break; fi
+              sleep 0.2
+            done
+          fi
+          accepts="$(settled_accepts)"
+          if [[ "$lpid" =~ ^[1-9][0-9]*$ ]]; then kill -KILL "$lpid" 2>/dev/null || true; fi
           if [ ! -s "$audit" ] || ! jq -s . "$audit" > /dev/null 2>&1; then
             unproven+=("NO_AUDIT_RECORDS")
           else
@@ -328,10 +365,26 @@ jobs:
             [ "$(flag leak_canary_value)" = false ] || fail+=("CANARY_VALUE_IN_TOOL_OUTPUT")
             [ "$(flag leak_fixture_content)" = false ] || fail+=("FIXTURE_CONTENT_IN_TOOL_OUTPUT")
           fi
+          # Accounting: accepts = setup control + (sandbox connections, expected 0) + post-probe control (exactly 1).
           if [ "$control" -lt 1 ]; then
             unproven+=("LISTENER_CONTROL_MISSING")
-          elif [ "$accepts" -gt "$control" ]; then
-            fail+=("HOST_LISTENER_ACCEPTED_SANDBOX_CONNECTION extra=$((accepts - control))")
+          elif [ "$post_ok" != 1 ]; then
+            # The network witness was not provably alive after the probe: "denied" proves nothing.
+            if [ "$before" -gt "$control" ]; then
+              fail+=("HOST_LISTENER_ACCEPTED_SANDBOX_CONNECTION extra=$((before - control))")
+            fi
+            if [ "$listener_alive" != 1 ]; then
+              unproven+=("LISTENER_DEAD_BEFORE_VERDICT")
+            else
+              unproven+=("LISTENER_POST_CONTROL_FAILED accepts_before=$before accepts_after=$accepts")
+            fi
+          else
+            extra=$((accepts - control - 1))
+            if [ "$extra" -gt 0 ]; then
+              fail+=("HOST_LISTENER_ACCEPTED_SANDBOX_CONNECTION extra=$extra")
+            elif [ "$extra" -lt 0 ]; then
+              unproven+=("LISTENER_ACCOUNTING_MISMATCH accepts=$accepts control=$control")
+            fi
           fi
           if [ "${#fail[@]}" -gt 0 ]; then
             verdict=SANDBOX_NEGATIVE_FAIL
@@ -343,7 +396,7 @@ jobs:
           {
             echo "### Sandbox negative probe: $verdict"
             echo "- run: $GITHUB_RUN_ID attempt $GITHUB_RUN_ATTEMPT, sha $GITHUB_SHA"
-            echo "- bash tool calls (pre/post): $pre/$post; listener accepts $accepts (control $control)"
+            echo "- bash tool calls (pre/post): $pre/$post; listener accepts $accepts (setup control $control, post-probe control ok=$post_ok)"
             echo "- failures: ${fail[*]:-none}"
             echo "- unproven: ${unproven[*]:-none}"
           } | tee -a "$GITHUB_STEP_SUMMARY"

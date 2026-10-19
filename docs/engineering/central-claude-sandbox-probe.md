@@ -57,7 +57,18 @@ Evidence (the model's words are never used):
 - Hooks record, per Bash call, the sha256 of the command, the `PROBE_*` marker lines, whether the hook itself
   can see the canary values, and whether a canary value or the fixture content appeared anywhere in the tool
   input/output. Values are not stored.
-- The listener log is compared with the control count; any extra accepted connection is a leak.
+- The listener is the independent network witness, so it must be proven alive AFTER the sandboxed probe, not only
+  before it. The verdict step keeps it running, checks that the recorded PID is still the `listener.py` process,
+  then makes a **post-probe positive control** connection from outside the sandbox and requires the accept count to
+  rise by exactly that one connection. The count is read after it stops changing, so a sandbox connection still in
+  flight is counted. Accounting: `accepts = setup control + sandbox connections (must be 0) + post-probe control (1)`.
+  Any extra accepted connection is a leak (`FAIL`). A listener that died or wedged between setup and the probe, a
+  PID that now belongs to another process, or a failed/unaccounted post-probe control gives `NOT_PROVEN`
+  (`LISTENER_DEAD_BEFORE_VERDICT`, `LISTENER_POST_CONTROL_FAILED`, `LISTENER_ACCOUNTING_MISMATCH`), because
+  `NET_LOOPBACK=DENIED` and `NET_CURL=DENIED` are vacuously true when nothing listens. The listener is stopped only
+  after this check. Executable fault-injection tests (listener killed, frozen with SIGSTOP, PID replaced by an
+  impostor, real late connection) assert none of these is `SANDBOX_NEGATIVE_PROVEN`; the first one was also run
+  against the previous workflow and it produced the false `SANDBOX_NEGATIVE_PROVEN` the review described.
 
 Verdicts (`Decide from trusted evidence only`, always runs, exit 0 only for PROVEN):
 
@@ -67,7 +78,8 @@ Verdicts (`Decide from trusted evidence only`, always runs, exit 0 only for PROV
   sandbox.
 - `SANDBOX_NEGATIVE_FAIL`: any denial is violated.
 - `NOT_PROVEN`: anything missing, ambiguous, forged or unobservable (no hook records, other commands run,
-  controls absent, hook cannot see canaries, listener control missing). The control canary check matters: if the
+  controls absent, hook cannot see canaries, listener control missing, listener not provably alive after the
+  probe). The control canary check matters: if the
   control canary is also absent the deny setting cannot be told apart from env scrubbing, so the result is
   NOT_PROVEN, not PROVEN.
 
