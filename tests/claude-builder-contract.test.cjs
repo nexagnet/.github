@@ -38,7 +38,8 @@ test('AI job has no GitHub write permission, OIDC or publisher credential', () =
   assert.equal(agent.permissions.issues, 'read');
   assert.equal(agent.permissions['pull-requests'], 'read');
   assert.equal(agent.permissions['id-token'], undefined);
-  assert.ok(!JSON.stringify(agent).includes('BUILDER_PUBLISHER_APP_PRIVATE_KEY'));
+  assert.ok(!JSON.stringify(agent).includes('secrets.BUILDER_PUBLISHER_APP_PRIVATE_KEY'));
+  // Naming a credential in sandbox deny rules does not expose its secret value.
   const step = agent.steps.find(s => s.name?.startsWith('Claude proposes'));
   assert.equal(step.with.github_token, '\${{ github.token }}');
   assert.match(step.with.claude_args, /--allowedTools "Read,Glob,Grep,Edit,Write,Bash"/);
