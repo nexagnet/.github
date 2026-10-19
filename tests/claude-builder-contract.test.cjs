@@ -219,7 +219,11 @@ test('strict sandbox is mandatory before enabling Bash and all credential escape
   assert.deepEqual(settings.sandbox.network.allowedDomains, []);
   assert.equal(settings.sandbox.filesystem.disabled, undefined);
   assert.ok(settings.sandbox.filesystem.denyRead.includes('~/.claude'));
-  assert.ok(settings.sandbox.filesystem.denyRead.includes('/proc'));
+  assert.ok(settings.sandbox.filesystem.denyRead.includes('/proc/self/environ'));
+  assert.ok(settings.sandbox.filesystem.denyRead.includes('/proc/*/environ'));
+  for (const name of ['Read(//proc/**)', 'Read(~/.claude/**)', 'Read(~/.config/gh/**)']) {
+    assert.ok(settings.permissions.deny.includes(name), name);
+  }
   for (const target of ['.github','infra','deploy','tools/autopilot']) {
     assert.ok(settings.sandbox.filesystem.denyWrite.some(p => p.endsWith('/' + target)), target);
   }
@@ -251,4 +255,16 @@ test('Builder installs test dependencies without running untrusted lifecycle scr
   assert.equal(prepare.env?.BUILDER_PUBLISHER_APP_PRIVATE_KEY, undefined);
   assert.equal(agent.permissions['id-token'], undefined);
   assert.equal(publish.needs.includes('agent'), true);
+});
+
+
+test('Agent failing to produce a patch reports fail-closed classification', () => {
+  const diagnostic = agent.steps.find(s => s.name?.startsWith('Agent failure classification'));
+  const patch = agent.steps.find(s => s.name?.startsWith('Produce UNTRUSTED patch'));
+  assert.ok(diagnostic && patch);
+  assert.equal(diagnostic.if, 'failure()');
+  assert.match(diagnostic.run, /BUILDER_AGENT_FAILED/);
+  assert.match(patch.run, /NO_PATCH/);
+  assert.match(patch.run, /git diff --cached --quiet/);
+  assert.ok(agent.steps.indexOf(diagnostic) < agent.steps.indexOf(patch));
 });
