@@ -38,10 +38,13 @@ test('AI job has no GitHub write permission, OIDC or publisher credential', () =
   assert.equal(agent.permissions.issues, 'read');
   assert.equal(agent.permissions['pull-requests'], 'read');
   assert.equal(agent.permissions['id-token'], undefined);
-  assert.ok(!JSON.stringify(agent).includes('BUILDER_PUBLISHER_APP_PRIVATE_KEY'));
+  assert.ok(!JSON.stringify(agent).includes('secrets.BUILDER_PUBLISHER_APP_PRIVATE_KEY'));
+  // Naming a credential in sandbox deny rules does not expose its secret value.
   const step = agent.steps.find(s => s.name?.startsWith('Claude proposes'));
   assert.equal(step.with.github_token, '\${{ github.token }}');
-  assert.match(step.with.claude_args, /--disallowedTools "Bash,WebFetch,WebSearch"/);
+  assert.match(step.with.claude_args, /--allowedTools "Read,Glob,Grep,Edit,Write,Bash"/);
+  assert.match(step.with.claude_args, /--disallowedTools "WebFetch,WebSearch"/);
+  assert.doesNotMatch(step.with.claude_args, /--dangerously-skip-permissions/);
 });
 
 test('Claude receives the frozen canonical Task Contract only after ready gate', () => {
@@ -203,4 +206,65 @@ test('Central control-plane CI verifies the real PR HEAD or pushed main commit',
   assert.ok(ci.includes('expected=${EXPECTED_SHA} actual=${actual}'));
   assert.ok(ci.includes('go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7'));
   assert.ok(ci.includes('node --test tests/claude-builder-contract.test.cjs tests/claude-reviewer-contract.test.cjs'));
+});
+
+
+test('strict sandbox is mandatory before enabling Bash and all credential escapes are blocked', () => {
+  const claude = agent.steps.find(s => s.name?.startsWith('Claude proposes'));
+  const settings = JSON.parse(claude.with.settings);
+  assert.equal(settings.sandbox.enabled, true);
+  assert.equal(settings.sandbox.failIfUnavailable, true);
+  assert.equal(settings.sandbox.allowUnsandboxedCommands, false);
+  assert.equal(settings.sandbox.autoAllowBashIfSandboxed, true);
+  assert.deepEqual(settings.sandbox.network.allowedDomains, []);
+  assert.equal(settings.sandbox.filesystem.disabled, undefined);
+  assert.ok(settings.sandbox.filesystem.denyRead.includes('~/.claude'));
+  assert.ok(settings.sandbox.filesystem.denyRead.includes('/proc/self/environ'));
+  assert.ok(settings.sandbox.filesystem.denyRead.includes('/proc/*/environ'));
+  for (const name of ['Read(//proc/**)', 'Read(~/.claude/**)', 'Read(~/.config/gh/**)']) {
+    assert.ok(settings.permissions.deny.includes(name), name);
+  }
+  for (const target of ['.github','infra','deploy','tools/autopilot']) {
+    assert.ok(settings.sandbox.filesystem.denyWrite.some(p => p.endsWith('/' + target)), target);
+  }
+  for (const secret of ['GITHUB_TOKEN','GH_TOKEN','CLAUDE_CODE_OAUTH_TOKEN','BUILDER_PUBLISHER_APP_PRIVATE_KEY']) {
+    assert.ok(settings.sandbox.credentials.envVars.some(x => x.name === secret && x.mode === 'deny'), secret);
+  }
+  assert.equal(agent.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, '1');
+  assert.equal(settings.permissions.deny.includes('Bash'), false);
+  assert.ok(settings.permissions.deny.includes('WebFetch'));
+  assert.ok(settings.permissions.deny.includes('WebSearch'));
+  assert.match(claude.with.prompt, /NO unsandboxed retry/);
+  assert.match(claude.with.claude_args, /--max-turns 80/);
+  assert.equal(claude.with.show_full_output, 'false');
+});
+
+test('Builder installs test dependencies without running untrusted lifecycle scripts, before Claude', () => {
+  const claude = agent.steps.find(s => s.name?.startsWith('Claude proposes'));
+  const prepare = agent.steps.find(s => s.name?.startsWith('Prepare pnpm offline'));
+  const node = agent.steps.filter(s => s.name?.startsWith('Set up Node'));
+  const install = agent.steps.find(s => s.name === 'Install bubblewrap for isolated Claude subprocesses');
+  assert.equal(node.length, 2);
+  assert.ok(prepare && install);
+  assert.ok(agent.steps.indexOf(prepare) < agent.steps.indexOf(claude));
+  assert.ok(agent.steps.indexOf(install) < agent.steps.indexOf(claude));
+  assert.match(prepare.run, /pnpm install --frozen-lockfile --ignore-scripts/);
+  assert.match(install.run, /bubblewrap socat/);
+  assert.match(install.run, /command -v socat/);
+  assert.equal(prepare.env?.CLAUDE_CODE_OAUTH_TOKEN, undefined);
+  assert.equal(prepare.env?.BUILDER_PUBLISHER_APP_PRIVATE_KEY, undefined);
+  assert.equal(agent.permissions['id-token'], undefined);
+  assert.equal(publish.needs.includes('agent'), true);
+});
+
+
+test('Agent failing to produce a patch reports fail-closed classification', () => {
+  const diagnostic = agent.steps.find(s => s.name?.startsWith('Agent failure classification'));
+  const patch = agent.steps.find(s => s.name?.startsWith('Produce UNTRUSTED patch'));
+  assert.ok(diagnostic && patch);
+  assert.equal(diagnostic.if, 'failure()');
+  assert.match(diagnostic.run, /BUILDER_AGENT_FAILED/);
+  assert.match(patch.run, /NO_PATCH/);
+  assert.match(patch.run, /git diff --cached --quiet/);
+  assert.ok(agent.steps.indexOf(diagnostic) < agent.steps.indexOf(patch));
 });
