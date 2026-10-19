@@ -331,7 +331,7 @@ test('Builder runner must prove strict isolated network namespace before Claude 
   const install = agent.steps.find(s => s.name === 'Install bubblewrap for isolated Claude subprocesses');
   const probe = agent.steps.find(s => s.name === 'Verify strict bwrap network sandbox before Claude');
   const claude = agent.steps.find(s => s.id === 'claude');
-  const publishToken = publish.steps.find(s => s.name?.startsWith('Mint limited publisher token'));
+  const publishToken = publish.steps.find(s => s.name === 'Mint restricted publisher token after PASS');
   assert.ok(install && probe && claude && publishToken);
   assert.ok(agent.steps.indexOf(install) < agent.steps.indexOf(probe));
   assert.ok(agent.steps.indexOf(probe) < agent.steps.indexOf(claude));
