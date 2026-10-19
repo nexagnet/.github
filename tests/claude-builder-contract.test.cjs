@@ -70,7 +70,7 @@ test('privileged publisher is strictly downstream from validation', () => {
   assert.match(validator, /git apply --check --index/);
   assert.match(validator, /Base HEAD changed/);
   assert.match(validator, /risk:\$EXPECTED_RISK/);
-  assert.match(publish.steps.at(-1).run, /-F draft=true/);
+  assert.match(publish.steps.find(s => s.id === 'draft').run, /-F draft=true/);
 });
 
 function extractCase(source, variable) {
@@ -129,58 +129,8 @@ test('file mode guard blocks symlink/submodule artifacts', () => {
   }
 });
 
-test('preflight rejects invalid actor/event and missing/conflicting/R3 risk', () => {
-  const folder = mkdtempSync(join(tmpdir(), 'nexagnet-builder-'));
-  try {
-    const bin = join(folder, 'bin');
-    mkdirSync(bin);
-    const gh = join(bin, 'gh');
-    writeFileSync(gh, [
-      '#!/bin/bash',
-      'set -euo pipefail',
-      'case "$*" in',
-      '  "api repos/nexagnet/example/issues/12") cat "$MOCK_ISSUE" ;;',
-      '  "api repos/nexagnet/example --jq .default_branch") echo main ;;',
-      '  "api repos/nexagnet/example/branches/main --jq .commit.sha") printf "a%.0s" {1..40}; echo ;;',
-      '  *) echo "unknown gh invocation" >&2; exit 2 ;;',
-      'esac'
-    ].join('\n'), { mode: 0o755 });
-    const eventFile = join(folder, 'event.json');
-    const issueFile = join(folder, 'issue.json');
-    const outFile = join(folder, 'output');
-    const headings = ['OBJECTIVE','SCOPE','OUT OF SCOPE','ACCEPTANCE','RISK','RUNTIME PROOF','STOP CONDITIONS']
-      .map(h => '## ' + h).join('\n');
-    const validEvent = { action: 'created', issue: { number: 12 }, comment: { user: { login: 'phungtienviet14-sketch' }, body: '@claude' } };
-    const validIssue = { state: 'open', labels: [{name:'risk:R1'}, {name:'autopilot:ready'}], body: headings };
-    function call(event, issue, actor = 'phungtienviet14-sketch', repository = 'nexagnet/example') {
-      writeFileSync(eventFile, JSON.stringify(event));
-      writeFileSync(issueFile, JSON.stringify(issue));
-      writeFileSync(outFile, '');
-      return spawnSync('bash', ['-c', preflight], {
-        encoding: 'utf8',
-        env: {
-          ...process.env, PATH: bin + ':' + process.env.PATH,
-          GITHUB_REPOSITORY_OWNER: 'nexagnet', GITHUB_REPOSITORY: repository,
-          GITHUB_EVENT_NAME: 'issue_comment', GITHUB_ACTOR: actor,
-          GITHUB_EVENT_PATH: eventFile, GITHUB_OUTPUT: outFile, ISSUE_NUMBER: '12',
-          MOCK_ISSUE: issueFile, GH_TOKEN: 'test-read-only-token'
-        }
-      }).status === 0;
-    }
-    assert.equal(call(validEvent, validIssue), true);
-    assert.equal(call(validEvent, { ...validIssue, state: 'closed' }), false);
-    assert.equal(call(validEvent, { ...validIssue, labels: [{name:'risk:R1'}] }), false);
-    assert.equal(call(validEvent, { ...validIssue, labels: [{name:'risk:R3'}] }), false);
-    assert.equal(call(validEvent, { ...validIssue, labels: [{name:'risk:R1'},{name:'risk:R2'}] }), false);
-    assert.equal(call(validEvent, { ...validIssue, body:'## OBJECTIVE' }), false);
-    assert.equal(call({...validEvent, action:'edited'}, validIssue), false);
-    assert.equal(call({...validEvent, issue:{number:12, pull_request:{url:'x'}}}, validIssue), false);
-    assert.equal(call(validEvent, validIssue, 'untrusted-user'), false);
-    assert.equal(call(validEvent, validIssue, 'phungtienviet14-sketch', 'nexagnet/.github'), false);
-  } finally {
-    rmSync(folder, { recursive: true, force: true });
-  }
-});
+// Actor/event/risk/contract gates now run against a fake GitHub in
+// tests/claude-builder-intent-idempotency.test.cjs (real preflight shell, strict intent, ledger, PR guard).
 
 test('Claude Builder bootstraps bubblewrap before action without disabling env isolation', () => {
   assert.equal(agent.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, '1');

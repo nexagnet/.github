@@ -19,6 +19,17 @@ on:
 
 permissions: {}
 
+# One Builder lifecycle (preflight -> agent -> publish) per repository+Issue at a
+# time. This is the ONLY concurrency declaration: a caller or child job reusing
+# this group name would deadlock/self-cancel. GitHub keeps at most one running
+# and one pending run per group (extra pending runs are cancelled, order not
+# guaranteed), so correctness never relies on this lock alone: the comment
+# ledger, live PR guard (preflight + publisher) and deterministic tie-break
+# below are independent defences.
+concurrency:
+  group: nexagnet-builder-${{ github.repository }}-issue-${{ inputs.issue_number }}
+  cancel-in-progress: false
+
 jobs:
   preflight:
     name: Read-only Task Contract validation
@@ -27,12 +38,16 @@ jobs:
     permissions:
       contents: read
       issues: read
+      pull-requests: read
     outputs:
       base_sha: ${{ steps.gate.outputs.base_sha }}
       base_branch: ${{ steps.gate.outputs.base_branch }}
       risk: ${{ steps.gate.outputs.risk }}
       contract_hash: ${{ steps.gate.outputs.contract_hash }}
       contract_b64: ${{ steps.gate.outputs.contract_b64 }}
+      command: ${{ steps.gate.outputs.command }}
+      attempt: ${{ steps.gate.outputs.attempt }}
+      comment_id: ${{ steps.gate.outputs.comment_id }}
     steps:
       - id: gate
         env:
@@ -41,19 +56,113 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Existing Builder branches for one Issue; same shape Reviewer/Repair parse.
+          # Identical copy in the publisher job; a contract test enforces equality.
+          # shellcheck disable=SC2034 # each caller reads a subset of the PR_* results
+          bot_pr_guard() {
+            local pages stats
+            pages="$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls?state=all&per_page=100")" || {
+              echo "::error::PR_LOOKUP_FAILED: cannot list pull requests; failing closed"; return 1;
+            }
+            stats="$(jq -s -c --arg repo "$GITHUB_REPOSITORY" \
+              --arg re "^claude/issue-${ISSUE_NUMBER}-[1-9][0-9]*-[1-9][0-9]*\$" '
+              (add // [])
+              | map(select((.head.ref | test($re))
+                  and ((.head.repo.full_name // "" | ascii_downcase) == ($repo | ascii_downcase))))
+              | {open: (map(select(.state == "open")) | length),
+                 merged: (map(select(.merged_at != null)) | length),
+                 total: length,
+                 open_min: (map(select(.state == "open") | .number) | min)}
+            ' <<< "$pages")" || {
+              echo "::error::PR_LOOKUP_FAILED: unparsable pull request list; failing closed"; return 1;
+            }
+            PR_OPEN="$(jq -r .open <<< "$stats")"
+            PR_MERGED="$(jq -r .merged <<< "$stats")"
+            PR_TOTAL="$(jq -r .total <<< "$stats")"
+            PR_OPEN_MIN="$(jq -r '.open_min // empty' <<< "$stats")"
+          }
           test "$GITHUB_REPOSITORY_OWNER" = "nexagnet"
           test "$GITHUB_REPOSITORY" != "nexagnet/.github" || {
             echo "::error::Control-plane repository is not a Builder consumer"; exit 1;
           }
           test "$GITHUB_EVENT_NAME" = "issue_comment"
           test "$GITHUB_ACTOR" = "phungtienviet14-sketch"
+          # A workflow "Re-run" replays the stored event verbatim. Only a NEW
+          # owner command comment may start another attempt.
+          test "${GITHUB_RUN_ATTEMPT:-1}" = "1" || {
+            echo "::error::REPLAY_REJECTED: re-run of a Builder event; post a new '@claude retry' comment"; exit 1;
+          }
           jq -e --arg actor "$GITHUB_ACTOR" --argjson number "$ISSUE_NUMBER" '
             .action == "created"
             and .issue.number == $number
             and (.issue | has("pull_request") | not)
+            and (.comment.id | type == "number")
             and .comment.user.login == $actor
-            and (.comment.body | type == "string" and contains("@claude"))
+            and .comment.user.type == "User"
+            and .sender.login == $actor
+            and (.comment.body | type == "string")
           ' "$GITHUB_EVENT_PATH" >/dev/null
+          # Intent: the WHOLE comment (trailing whitespace ignored) must be exactly
+          # one of two commands. Prose, reports, quotes, code spans/blocks, multi-line
+          # text and bot output can never match.
+          command="$(jq -r '.comment.body | sub("[ \t\r\n]+$"; "")
+            | if . == "@claude" then "run"
+              elif . == "@claude retry" then "retry"
+              else "none" end' "$GITHUB_EVENT_PATH")"
+          case "$command" in
+            run|retry) ;;
+            *) echo "::error::INTENT_REJECTED: comment is not a standalone '@claude' or '@claude retry' command"; exit 1 ;;
+          esac
+          comment_id="$(jq -r .comment.id "$GITHUB_EVENT_PATH")"
+          [[ "$comment_id" =~ ^[1-9][0-9]*$ ]]
+          # Re-fetch the live comment: same id, owner User, body unchanged since the event.
+          live="$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$comment_id")"
+          jq -e --arg actor "$GITHUB_ACTOR" --argjson id "$comment_id" \
+            --argjson number "$ISSUE_NUMBER" --slurpfile ev "$GITHUB_EVENT_PATH" '
+            .id == $id
+            and .user.login == $actor
+            and .user.type == "User"
+            and .body == $ev[0].comment.body
+            and (.issue_url | endswith("/issues/" + ($number | tostring)))
+          ' <<< "$live" >/dev/null || {
+            echo "::error::COMMENT_CHANGED: live comment differs from the event"; exit 1;
+          }
+          # Durable, owner-authored attempt ledger = earlier command comments by the
+          # owner (human User) on this Issue. Duplicates and rejected commands count.
+          pages="$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments?per_page=100")" || {
+            echo "::error::LEDGER_LOOKUP_FAILED: cannot list Issue comments; failing closed"; exit 1;
+          }
+          earlier="$(jq -s --arg actor "$GITHUB_ACTOR" --argjson id "$comment_id" '
+            (add // [])
+            | [ .[] | select(.user.login == $actor and .user.type == "User" and .id < $id
+                and ((.body // "") | sub("[ \t\r\n]+$"; "") | IN("@claude", "@claude retry"))) ]
+            | length' <<< "$pages")"
+          [[ "$earlier" =~ ^[0-9]+$ ]]
+          max_attempts=3
+          bot_pr_guard
+          case "$command" in
+            run)
+              test "$earlier" -eq 0 || {
+                echo "::error::DUPLICATE_COMMAND_REJECTED: this Issue already has an owner command; use '@claude retry'"; exit 1;
+              }
+              test "$PR_TOTAL" -eq 0 || {
+                echo "::error::EXISTING_PR_REJECTED: Builder PR history exists; use '@claude retry'"; exit 1;
+              } ;;
+            retry)
+              test "$earlier" -ge 1 || {
+                echo "::error::RETRY_WITHOUT_ATTEMPT: no earlier '@claude' command exists"; exit 1;
+              }
+              test "$earlier" -lt "$max_attempts" || {
+                echo "::error::RETRY_BUDGET_EXHAUSTED: at most $max_attempts attempts per Issue"; exit 1;
+              }
+              test "$PR_OPEN" -eq 0 || {
+                echo "::error::OPEN_PR_REJECTED: a Builder Draft PR is already open for this Issue"; exit 1;
+              }
+              test "$PR_MERGED" -eq 0 || {
+                echo "::error::MERGED_PR_REJECTED: a Builder PR was already merged for this Issue"; exit 1;
+              } ;;
+          esac
+          attempt=$((earlier + 1))
           issue="$(gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER")"
           jq -e '.state == "open" and (has("pull_request") | not)' <<< "$issue" >/dev/null
           risk="$(jq -r '[.labels[].name | select(startswith("risk:"))] | join(",")' <<< "$issue")"
@@ -82,6 +191,9 @@ jobs:
             echo "risk=$(printf '%s' "$risk" | cut -d: -f2)"
             echo "base_sha=$base_sha"
             echo "base_branch=$base_branch"
+            echo "command=$command"
+            echo "attempt=$attempt"
+            echo "comment_id=$comment_id"
           } >> "$GITHUB_OUTPUT"
 
   agent:
@@ -92,9 +204,6 @@ jobs:
     # Never relax AppArmor/sysctl or fall back to unsandboxed Bash.
     runs-on: ubuntu-22.04
     timeout-minutes: 120
-    concurrency:
-      group: nexagnet-builder-${{ github.repository }}-${{ inputs.issue_number }}
-      cancel-in-progress: false
     permissions:
       contents: read
       issues: read
@@ -316,6 +425,7 @@ jobs:
     permissions:
       contents: read
       issues: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -385,6 +495,43 @@ jobs:
           test "$count" -gt 0
           echo "Validated $count paths from untrusted artifact"
 
+      # Live duplicate check with the READ-ONLY token, before any write credential
+      # exists. Fails closed on 403/rate-limit/unparsable pages.
+      - name: Re-check no competing Builder PR before minting write token
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2034 # each caller reads a subset of the PR_* results
+          bot_pr_guard() {
+            local pages stats
+            pages="$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls?state=all&per_page=100")" || {
+              echo "::error::PR_LOOKUP_FAILED: cannot list pull requests; failing closed"; return 1;
+            }
+            stats="$(jq -s -c --arg repo "$GITHUB_REPOSITORY" \
+              --arg re "^claude/issue-${ISSUE_NUMBER}-[1-9][0-9]*-[1-9][0-9]*\$" '
+              (add // [])
+              | map(select((.head.ref | test($re))
+                  and ((.head.repo.full_name // "" | ascii_downcase) == ($repo | ascii_downcase))))
+              | {open: (map(select(.state == "open")) | length),
+                 merged: (map(select(.merged_at != null)) | length),
+                 total: length,
+                 open_min: (map(select(.state == "open") | .number) | min)}
+            ' <<< "$pages")" || {
+              echo "::error::PR_LOOKUP_FAILED: unparsable pull request list; failing closed"; return 1;
+            }
+            PR_OPEN="$(jq -r .open <<< "$stats")"
+            PR_MERGED="$(jq -r .merged <<< "$stats")"
+            PR_TOTAL="$(jq -r .total <<< "$stats")"
+            PR_OPEN_MIN="$(jq -r '.open_min // empty' <<< "$stats")"
+          }
+          bot_pr_guard
+          if [ "$PR_OPEN" -ne 0 ] || [ "$PR_MERGED" -ne 0 ]; then
+            echo "::error::DUPLICATE_PR_REJECTED: Builder PR already open or merged for Issue #$ISSUE_NUMBER"; exit 1
+          fi
+
       # This App must be separately approved by owner, scoped to the consumer,
       # and MUST NOT have Workflows/Actions/Administration permissions.
       # It is never exposed to Claude. Do not configure these secrets yet.
@@ -399,16 +546,113 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
 
-      - name: Publish only a DRAFT PR, never merge or deploy
+      # Durable at-most-one guarantee (R3 #33). Creating a git ref fails with 422 when the name exists, so exactly one
+      # publisher can own a generation (= number of earlier Builder PRs for this Issue) however many runners passed
+      # every check together. The claim is taken BEFORE any push or PR and does not depend on a loser surviving to run a
+      # later cleanup step: a runner killed or cancelled at any point leaves at most the one PR its claim allows.
+      # A claim whose holder died before opening a PR fails closed (PUBLISH_CLAIM_REJECTED); the owner releases it by
+      # deleting that single ref (docs/engineering/central-claude-builder.md). Uses the publisher token already minted
+      # (contents: write); no new permission.
+      - id: claim
+        name: Claim the single publish slot for this Issue (atomic, before any push)
         shell: bash
         env:
           GH_TOKEN: ${{ steps.publisher.outputs.token }}
           ISSUE_NUMBER: ${{ inputs.issue_number }}
           BASE_SHA: ${{ needs.preflight.outputs.base_sha }}
-          BASE_BRANCH: ${{ needs.preflight.outputs.base_branch }}
-          RISK: ${{ needs.preflight.outputs.risk }}
         run: |
           set -euo pipefail
+          # shellcheck disable=SC2034 # each caller reads a subset of the PR_* results
+          bot_pr_guard() {
+            local pages stats
+            pages="$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls?state=all&per_page=100")" || {
+              echo "::error::PR_LOOKUP_FAILED: cannot list pull requests; failing closed"; return 1;
+            }
+            stats="$(jq -s -c --arg repo "$GITHUB_REPOSITORY" \
+              --arg re "^claude/issue-${ISSUE_NUMBER}-[1-9][0-9]*-[1-9][0-9]*\$" '
+              (add // [])
+              | map(select((.head.ref | test($re))
+                  and ((.head.repo.full_name // "" | ascii_downcase) == ($repo | ascii_downcase))))
+              | {open: (map(select(.state == "open")) | length),
+                 merged: (map(select(.merged_at != null)) | length),
+                 total: length,
+                 open_min: (map(select(.state == "open") | .number) | min)}
+            ' <<< "$pages")" || {
+              echo "::error::PR_LOOKUP_FAILED: unparsable pull request list; failing closed"; return 1;
+            }
+            PR_OPEN="$(jq -r .open <<< "$stats")"
+            PR_MERGED="$(jq -r .merged <<< "$stats")"
+            PR_TOTAL="$(jq -r .total <<< "$stats")"
+            PR_OPEN_MIN="$(jq -r '.open_min // empty' <<< "$stats")"
+          }
+          [[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]*$ ]]
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          bot_pr_guard
+          if [ "$PR_OPEN" -ne 0 ] || [ "$PR_MERGED" -ne 0 ]; then
+            echo "::error::DUPLICATE_PR_REJECTED: Builder PR already open or merged for Issue #$ISSUE_NUMBER"; exit 1
+          fi
+          [[ "$PR_TOTAL" =~ ^[0-9]+$ ]]
+          claim="refs/builder-claims/issue-${ISSUE_NUMBER}-gen-${PR_TOTAL}"
+          [[ "$claim" =~ ^refs/builder-claims/issue-[1-9][0-9]*-gen-[0-9]+$ ]]
+          git check-ref-format "$claim" >/dev/null
+          err="$(mktemp)"
+          if ! gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="$claim" -f sha="$BASE_SHA" >/dev/null 2>"$err"; then
+            if grep -q 'Reference already exists' "$err"; then
+              echo "::error::PUBLISH_CLAIM_REJECTED: another publisher owns $claim (live or stranded); failing closed"; exit 1
+            fi
+            echo "::error::PUBLISH_CLAIM_FAILED: cannot create $claim; failing closed"; exit 1
+          fi
+          echo "ref=$claim" >> "$GITHUB_OUTPUT"
+          echo "PUBLISH_CLAIMED: $claim"
+
+      - id: draft
+        name: Publish only a DRAFT PR, never merge or deploy
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.publisher.outputs.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          CLAIM_REF: ${{ steps.claim.outputs.ref }}
+          BASE_SHA: ${{ needs.preflight.outputs.base_sha }}
+          BASE_BRANCH: ${{ needs.preflight.outputs.base_branch }}
+          RISK: ${{ needs.preflight.outputs.risk }}
+          COMMAND: ${{ needs.preflight.outputs.command }}
+          ATTEMPT: ${{ needs.preflight.outputs.attempt }}
+          COMMENT_ID: ${{ needs.preflight.outputs.comment_id }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2034 # each caller reads a subset of the PR_* results
+          bot_pr_guard() {
+            local pages stats
+            pages="$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls?state=all&per_page=100")" || {
+              echo "::error::PR_LOOKUP_FAILED: cannot list pull requests; failing closed"; return 1;
+            }
+            stats="$(jq -s -c --arg repo "$GITHUB_REPOSITORY" \
+              --arg re "^claude/issue-${ISSUE_NUMBER}-[1-9][0-9]*-[1-9][0-9]*\$" '
+              (add // [])
+              | map(select((.head.ref | test($re))
+                  and ((.head.repo.full_name // "" | ascii_downcase) == ($repo | ascii_downcase))))
+              | {open: (map(select(.state == "open")) | length),
+                 merged: (map(select(.merged_at != null)) | length),
+                 total: length,
+                 open_min: (map(select(.state == "open") | .number) | min)}
+            ' <<< "$pages")" || {
+              echo "::error::PR_LOOKUP_FAILED: unparsable pull request list; failing closed"; return 1;
+            }
+            PR_OPEN="$(jq -r .open <<< "$stats")"
+            PR_MERGED="$(jq -r .merged <<< "$stats")"
+            PR_TOTAL="$(jq -r .total <<< "$stats")"
+            PR_OPEN_MIN="$(jq -r '.open_min // empty' <<< "$stats")"
+          }
+          [[ "$COMMAND" =~ ^(run|retry)$ ]]
+          [[ "$ATTEMPT" =~ ^[1-3]$ ]]
+          [[ "$COMMENT_ID" =~ ^[1-9][0-9]*$ ]]
+          # No push or PR without the atomic claim taken by the previous step (fails closed when it is absent).
+          [[ "$CLAIM_REF" =~ ^refs/builder-claims/issue-${ISSUE_NUMBER}-gen-[0-9]+$ ]]
+          # Last look immediately before the first push with the write token.
+          bot_pr_guard
+          if [ "$PR_OPEN" -ne 0 ] || [ "$PR_MERGED" -ne 0 ]; then
+            echo "::error::DUPLICATE_PR_REJECTED: Builder PR already open or merged for Issue #$ISSUE_NUMBER"; exit 1
+          fi
           test "$(git rev-parse HEAD)" = "$BASE_SHA"
           current="$(gh api "repos/$GITHUB_REPOSITORY/branches/$BASE_BRANCH" --jq .commit.sha)"
           test "$current" = "$BASE_SHA"
@@ -426,8 +670,67 @@ jobs:
           Nexagnet central Builder; UNTRUSTED patch checked on clean runner.
           RISK: R$RISK. Draft only; human review and exact-head CI required.
           Base SHA: $BASE_SHA
-          Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          gh api -X POST "repos/$GITHUB_REPOSITORY/pulls" \
+          Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          Trigger: command=$COMMAND attempt=$ATTEMPT/3 comment=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER#issuecomment-$COMMENT_ID"
+          created="$(gh api -X POST "repos/$GITHUB_REPOSITORY/pulls" \
             -f title="[claude] Issue #$ISSUE_NUMBER" \
             -f head="$branch" -f base="$BASE_BRANCH" \
-            -F draft=true -f body="$body" --jq .html_url
+            -F draft=true -f body="$body")"
+          number="$(jq -r .number <<< "$created")"
+          [[ "$number" =~ ^[1-9][0-9]*$ ]]
+          jq -r .html_url <<< "$created"
+          {
+            echo "pr_number=$number"
+            echo "branch=$branch"
+          } >> "$GITHUB_OUTPUT"
+
+      # Defence in depth only. The atomic claim step above is what guarantees at most one Draft; this step
+      # additionally lets the lowest open PR number in this Issue's Builder namespace win if a PR somehow exists
+      # next to another (e.g. a manually opened one), and every later one closes ITSELF (never another PR) and
+      # deletes its own branch. It is NOT relied on for the invariant: it cannot run if the runner is killed.
+      - name: Resolve publish race deterministically (lowest PR number wins)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.publisher.outputs.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          PR_NUMBER: ${{ steps.draft.outputs.pr_number }}
+          BRANCH: ${{ steps.draft.outputs.branch }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2034 # each caller reads a subset of the PR_* results
+          bot_pr_guard() {
+            local pages stats
+            pages="$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls?state=all&per_page=100")" || {
+              echo "::error::PR_LOOKUP_FAILED: cannot list pull requests; failing closed"; return 1;
+            }
+            stats="$(jq -s -c --arg repo "$GITHUB_REPOSITORY" \
+              --arg re "^claude/issue-${ISSUE_NUMBER}-[1-9][0-9]*-[1-9][0-9]*\$" '
+              (add // [])
+              | map(select((.head.ref | test($re))
+                  and ((.head.repo.full_name // "" | ascii_downcase) == ($repo | ascii_downcase))))
+              | {open: (map(select(.state == "open")) | length),
+                 merged: (map(select(.merged_at != null)) | length),
+                 total: length,
+                 open_min: (map(select(.state == "open") | .number) | min)}
+            ' <<< "$pages")" || {
+              echo "::error::PR_LOOKUP_FAILED: unparsable pull request list; failing closed"; return 1;
+            }
+            PR_OPEN="$(jq -r .open <<< "$stats")"
+            PR_MERGED="$(jq -r .merged <<< "$stats")"
+            PR_TOTAL="$(jq -r .total <<< "$stats")"
+            PR_OPEN_MIN="$(jq -r '.open_min // empty' <<< "$stats")"
+          }
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
+          [[ "$BRANCH" =~ ^claude/issue-${ISSUE_NUMBER}-[1-9][0-9]*-[1-9][0-9]*$ ]]
+          bot_pr_guard
+          test -n "$PR_OPEN_MIN" || {
+            echo "::error::PUBLISH_STATE_UNKNOWN: own PR #$PR_NUMBER not visible; failing closed"; exit 1;
+          }
+          if [ "$PR_OPEN_MIN" != "$PR_NUMBER" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" -f state=closed >/dev/null
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$BRANCH" >/dev/null || \
+              echo "::warning::could not delete duplicate branch $BRANCH"
+            echo "::error::DUPLICATE_PUBLISH_RACE_LOST: PR #$PR_OPEN_MIN already owns Issue #$ISSUE_NUMBER; closed #$PR_NUMBER"
+            exit 1
+          fi
+          echo "PUBLISH_UNIQUE: PR #$PR_NUMBER is the only open Builder PR for Issue #$ISSUE_NUMBER"
