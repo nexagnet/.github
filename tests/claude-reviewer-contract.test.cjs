@@ -179,3 +179,55 @@ test('trusted Reporter is the only PR-comment writer and enforces diff inspectio
   assert.doesNotMatch(run, /gh pr merge|git push|repository_dispatch/);
   assert.ok(!JSON.stringify(jobs.review).includes('BUILDER_PUBLISHER_APP_PRIVATE_KEY'));
 });
+
+
+test('manual Claude Project lane needs owner-authored PR and SHA-bound comment; Publisher lane stays strict', () => {
+  assert.match(preflight, /provenance=publisher/);
+  assert.match(preflight, /provenance=owner/);
+  assert.match(preflight, /\.user\.login == "nexagnet-builder-publisher\[bot\]"/);
+  assert.match(preflight, /\.user\.login == "phungtienviet14-sketch" and \.user\.type == "User"/);
+  assert.match(preflight, /NEXAGNET_REVIEW_REQUEST HEAD_SHA=/);
+  assert.match(preflight, /No current-SHA owner review attestation/);
+  assert.match(preflight, /Untrusted PR provenance/);
+  assert.match(preflight, /\[\[ "\$branch" =~ \^claude\//);
+  assert.ok(jobs.gate.outputs.provenance.includes('steps.verify.outputs.provenance'));
+  assert.ok(jobs.gate.outputs.contract_hash.includes('steps.verify.outputs.contract_hash'));
+  assert.ok(!preflight.includes("allowed_bots: '*'"));
+});
+
+test('actual GitHub jq attestation predicate rejects spoof, stale SHA and bot impersonation', () => {
+  const q = preflight.match(/jq -e --arg sha "\$SHA" '([\s\S]*?)' <<< "\$comments"/);
+  assert.ok(q, 'owner comment predicate must be executable');
+  const sha = 'a'.repeat(40);
+  const owner = (body, login = 'phungtienviet14-sketch', type = 'User') =>
+    ({user:{login,type},body});
+  const exact = 'NEXAGNET_REVIEW_REQUEST HEAD_SHA=' + sha;
+  const cases = [
+    [[owner(exact)], true],
+    [[owner(exact, 'attacker')], false],
+    [[owner(exact, 'phungtienviet14-sketch', 'Bot')], false],
+    [[owner(exact.slice(0, -1) + 'b')], false],
+    [[owner(exact + ' --skip-checks')], false],
+    [[owner('readme'), owner(exact)], true],
+  ];
+  for (const [comments, expected] of cases) {
+    const result = spawnSync('jq', ['-e', '--arg', 'sha', sha, q[1]], {
+      input: JSON.stringify(comments), encoding: 'utf8'
+    });
+    assert.equal(result.status === 0, expected, JSON.stringify(comments));
+  }
+});
+
+test('trusted Reporter revalidates manual consent and contract after AI review', () => {
+  assert.match(reporter, /PROVENANCE/);
+  assert.match(reporter, /Unknown reviewer provenance/);
+  assert.match(reporter, /NEXAGNET_REVIEW_REQUEST HEAD_SHA=/);
+  assert.match(reporter, /Task Contract drift after review/);
+  assert.match(reporter, /CONTRACT_HASH/);
+  assert.match(reporter, /pull_requests\[\]\?\.number/);
+  assert.equal(jobs.report.steps[0].env.PROVENANCE.includes('needs.gate.outputs.provenance'), true);
+  assert.equal(jobs.report.steps[0].env.CONTRACT_HASH.includes('needs.gate.outputs.contract_hash'), true);
+  assert.equal(jobs.gate.permissions['pull-requests'], 'read');
+  assert.equal(jobs.review.permissions['pull-requests'], 'read');
+  assert.equal(jobs.report.permissions['pull-requests'], 'write');
+});

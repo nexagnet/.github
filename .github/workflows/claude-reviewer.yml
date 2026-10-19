@@ -36,6 +36,8 @@ jobs:
       contract: ${{ steps.verify.outputs.contract }}
       issue: ${{ steps.verify.outputs.issue }}
       risk: ${{ steps.verify.outputs.risk }}
+      provenance: ${{ steps.verify.outputs.provenance }}
+      contract_hash: ${{ steps.verify.outputs.contract_hash }}
     steps:
       - id: verify
         shell: bash
@@ -69,12 +71,32 @@ jobs:
           test "$(grep -cE '[0-9]' <<< "$refs" || true)" = 1
           issue_id="$(awk '{print $NF}' <<< "$refs" | tr -d '#')"
           [[ "$issue_id" =~ ^[1-9][0-9]*$ ]]
-          # Only PRs emitted by the validated central Builder publisher may enter
-          # this Reviewer. Existing V4 autopilot branches remain on V4 Reviewer.
+          # Two explicit provenance lanes. NEVER trust PR body text as authorization.
+          # Lane 1: existing validated Publisher bot (no behavior change).
+          # Lane 2: owner-authored same-repo Claude Project PR with a SHA-bound
+          # comment authored by the owner. A comment by anyone else is NOT consent.
           branch="$(jq -r .head.ref <<< "$pr")"
-          [[ "$branch" =~ ^claude/issue-([1-9][0-9]*)-([1-9][0-9]*)-([1-9][0-9]*)$ ]]
-          test "$(printf '%s' "$branch" | cut -d- -f2)" = "$issue_id"
-          jq -e '.user.login == "nexagnet-builder-publisher[bot]" and .user.type == "Bot"' <<< "$pr" >/dev/null
+          if jq -e '.user.login == "nexagnet-builder-publisher[bot]" and .user.type == "Bot"' <<< "$pr" >/dev/null; then
+            [[ "$branch" =~ ^claude/issue-([1-9][0-9]*)-([1-9][0-9]*)-([1-9][0-9]*)$ ]]
+            test "$(printf '%s' "$branch" | cut -d- -f2)" = "$issue_id"
+            provenance=publisher
+          elif jq -e '.user.login == "phungtienviet14-sketch" and .user.type == "User"' <<< "$pr" >/dev/null; then
+            [[ "$branch" =~ ^claude/[a-zA-Z0-9._/-]+$ ]]
+            comments="$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments?per_page=100")"
+            test "$(jq length <<< "$comments")" -lt 100 || {
+              echo "::error::Owner attestation comments are not fully enumerable"; exit 1;
+            }
+            jq -e --arg sha "$SHA" '
+              any(.[]; .user.login == "phungtienviet14-sketch"
+                and .user.type == "User"
+                and .body == ("NEXAGNET_REVIEW_REQUEST HEAD_SHA=" + $sha))
+            ' <<< "$comments" >/dev/null || {
+              echo "::error::No current-SHA owner review attestation"; exit 1;
+            }
+            provenance=owner
+          else
+            echo "::error::Untrusted PR provenance"; exit 1;
+          fi
           issue="$(gh api "repos/$GITHUB_REPOSITORY/issues/$issue_id")"
           jq -e '.state == "open" and (has("pull_request") | not)' <<< "$issue" >/dev/null
           risk="$(jq -r '[.labels[].name | select(startswith("risk:"))] | join(",")' <<< "$issue")"
@@ -113,6 +135,8 @@ jobs:
             echo "base_sha=$base_sha"
             echo "issue=$issue_id"
             echo "risk=$(cut -d: -f2 <<< "$risk")"
+            echo "provenance=$provenance"
+            echo "contract_hash=$(printf '%s' "$contract" | sha256sum | awk '{print $1}')"
             echo "contract=$(printf '%s' "$contract" | base64 -w0)"
           } >> "$GITHUB_OUTPUT"
 
@@ -215,6 +239,8 @@ jobs:
           SHA: ${{ needs.gate.outputs.head }}
           TASK_ID: ${{ needs.gate.outputs.issue }}
           RISK: ${{ needs.gate.outputs.risk }}
+          PROVENANCE: ${{ needs.gate.outputs.provenance }}
+          CONTRACT_HASH: ${{ needs.gate.outputs.contract_hash }}
           RUN: ${{ inputs.ci_run_id }}
           RESULT: ${{ needs.review.outputs.result }}
         run: |
@@ -238,13 +264,45 @@ jobs:
               else true end)
           ' <<< "$RESULT" >/dev/null
           pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR")"
-          jq -e --arg sha "$SHA" '.state == "open" and .head.sha == $sha' <<< "$pr" >/dev/null
+          jq -e --arg sha "$SHA" --arg repo "$GITHUB_REPOSITORY" '
+            .state == "open" and .head.sha == $sha
+            and .head.repo.full_name == $repo and .base.repo.full_name == $repo
+          ' <<< "$pr" >/dev/null
+          # Re-check current owner attestation and linkage after the AI step;
+          # deleted consent / retargeted PR / altered Task Contract cannot publish.
+          refs="$(jq -r '.body // ""' <<< "$pr" | grep -Eoi '(Closes|Refs|Relates to) #[0-9]+' || true)"
+          test "$(grep -cE '[0-9]' <<< "$refs" || true)" = 1
+          test "$(awk '{print $NF}' <<< "$refs" | tr -d '#')" = "$TASK_ID"
+          if test "$PROVENANCE" = owner; then
+            jq -e '.user.login == "phungtienviet14-sketch" and .user.type == "User"' <<< "$pr" >/dev/null
+            [[ "$(jq -r '.head.ref' <<< "$pr")" =~ ^claude/[a-zA-Z0-9._/-]+$ ]]
+            comments="$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments?per_page=100")"
+            test "$(jq length <<< "$comments")" -lt 100
+            jq -e --arg sha "$SHA" '
+              any(.[]; .user.login == "phungtienviet14-sketch"
+                and .user.type == "User"
+                and .body == ("NEXAGNET_REVIEW_REQUEST HEAD_SHA=" + $sha))
+            ' <<< "$comments" >/dev/null
+          elif test "$PROVENANCE" = publisher; then
+            jq -e '.user.login == "nexagnet-builder-publisher[bot]" and .user.type == "Bot"' <<< "$pr" >/dev/null
+            [[ "$(jq -r '.head.ref' <<< "$pr")" =~ ^claude/issue-([1-9][0-9]*)-([1-9][0-9]*)-([1-9][0-9]*)$ ]]
+          else
+            echo "::error::Unknown reviewer provenance"; exit 1
+          fi
           issue="$(gh api "repos/$GITHUB_REPOSITORY/issues/$TASK_ID")"
+          test "$(printf '%s' "$(jq -r '.body // ""' <<< "$issue")" | sha256sum | awk '{print $1}')" = "$CONTRACT_HASH" || {
+            echo "::error::Task Contract drift after review"; exit 1;
+          }
           jq -e --arg risk "risk:$RISK" '
             .state == "open" and ([.labels[].name | select(startswith("risk:"))] == [$risk])
           ' <<< "$issue" >/dev/null
           run="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN")"
-          jq -e --arg sha "$SHA" '.conclusion == "success" and .head_sha == $sha' <<< "$run" >/dev/null
+          jq -e --arg sha "$SHA" --argjson pr "$PR" '
+            .name == "ci" and .event == "pull_request"
+            and .status == "completed" and .conclusion == "success"
+            and .head_sha == $sha
+            and ([.pull_requests[]?.number] | length == 1 and .[0] == $pr)
+          ' <<< "$run" >/dev/null
           verdict="$(jq -r .verdict <<< "$RESULT")"
           summary="$(jq -r .summary <<< "$RESULT")"
           findings="$(jq -r '[.findings[] | .severity + " " + .path + ":" + (.line|tostring) + " " + .message] | join("\n")' <<< "$RESULT")"
