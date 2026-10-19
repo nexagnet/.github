@@ -128,7 +128,6 @@ jobs:
           node-version: '22'
       - name: Prepare pnpm offline test dependencies without lifecycle scripts
         shell: bash
-        timeout-minutes: 12
         run: |
           set -euo pipefail
           if test -f package.json && test -f pnpm-lock.yaml; then
