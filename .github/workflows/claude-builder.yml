@@ -169,7 +169,18 @@ jobs:
             network access and NO unsandboxed retry. Do not request bypass.
             If a test requires network, customer credentials, production,
             or sandbox relaxation, report the blocker and stop.
-            If requirements are ambiguous, stop without changes.
+            A trusted preflight has already verified Issue readiness, risk,
+            and frozen Task Contract. The runtime proof and owner merge gates
+            describe DOWNSTREAM evidence; they do not forbid preparing local
+            scoped edits now. Read the Task Contract, then use Write or Edit
+            to actually produce the explicitly requested scoped changes.
+            For a docs-only task, create the requested documentation file.
+            Do not finish successfully with no edits. When an actual blocker
+            prevents editing, return BLOCKED with a precise blocker_code;
+            do not invent file changes or bypass any tool restriction.
+            Return APPLIED only when you really made local worktree edits;
+            the trusted patch/export job will independently verify them.
+            Report only a bounded structured status, never secret values.
           settings: |
             {
               "sandbox": {
@@ -221,6 +232,7 @@ jobs:
             --max-turns 80
             --allowedTools "Read,Glob,Grep,Edit,Write,Bash"
             --disallowedTools "WebFetch,WebSearch"
+            --json-schema '{"type":"object","additionalProperties":false,"required":["status","blocker_code","summary","local_checks_attempted"],"properties":{"status":{"enum":["APPLIED","BLOCKED"]},"blocker_code":{"enum":["NONE","UNREADABLE_CONTRACT","AMBIGUOUS_SCOPE","SANDBOX_UNAVAILABLE","TOOL_DENIED","NETWORK_REQUIRED","DEPENDENCY_FAILURE","OTHER"]},"summary":{"type":"string","maxLength":500},"local_checks_attempted":{"type":"boolean"}}}'
 
       - name: Agent failure classification (no writes, no secret output)
         if: failure()
@@ -228,6 +240,34 @@ jobs:
         run: |
           echo "::error::BUILDER_AGENT_FAILED: no patch may be published; inspect Claude step for installation, strict sandbox, denied tool or turn-limit causes."
           echo "BUILDER_AGENT_FAILED (unverified root cause)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Validate bounded agent status (model signal, not patch proof)
+        shell: bash
+        env:
+          STRUCTURED: ${{ steps.claude.outputs.structured_output }}
+        run: |
+          set -euo pipefail
+          test -n "$STRUCTURED" || {
+            echo "::error::BUILDER_STATUS_MISSING: no structured model outcome"; exit 1;
+          }
+          test "$(printf '%s' "$STRUCTURED" | wc -c)" -le 4000
+          jq -e '
+            type == "object"
+            and (.status == "APPLIED" or .status == "BLOCKED")
+            and (.blocker_code | IN("NONE","UNREADABLE_CONTRACT",
+                "AMBIGUOUS_SCOPE","SANDBOX_UNAVAILABLE","TOOL_DENIED",
+                "NETWORK_REQUIRED","DEPENDENCY_FAILURE","OTHER"))
+            and (.summary | type == "string" and length <= 500)
+            and (.local_checks_attempted | type == "boolean")
+            and (if .status == "APPLIED" then .blocker_code == "NONE"
+                 else .blocker_code != "NONE" end)
+          ' <<< "$STRUCTURED" >/dev/null
+          status="$(jq -r .status <<< "$STRUCTURED")"
+          code="$(jq -r .blocker_code <<< "$STRUCTURED")"
+          echo "BUILDER_STATUS=$status BLOCKER_CODE=$code" >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::BUILDER_STATUS=$status BLOCKER_CODE=$code"
+          test "$status" = APPLIED || {
+            echo "::error::BUILDER_BLOCKED: $code; no patch will be published"; exit 1;
+          }
       - name: Produce UNTRUSTED patch, never push from this job
         shell: bash
         run: |
