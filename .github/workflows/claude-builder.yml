@@ -114,6 +114,29 @@ jobs:
           test -s "$RUNNER_TEMP/task-contract.md"
           test "$(wc -c < "$RUNNER_TEMP/task-contract.md")" -le 30000
 
+      # Install dependency tooling without executing untrusted lifecycle scripts.
+      # No Anthropic/Publisher credentials are present in this preparation step.
+      - name: Set up Node for reproducible consumer checks
+        if: hashFiles('.nvmrc') != ''
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: .nvmrc
+      - name: Set up Node 22 fallback for non-nvmrc repositories
+        if: hashFiles('.nvmrc') == ''
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: '22'
+      - name: Prepare pnpm offline test dependencies without lifecycle scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -f package.json && test -f pnpm-lock.yaml; then
+            corepack enable
+            pnpm install --frozen-lockfile --ignore-scripts
+          else
+            echo "No pnpm project at repository root; skipping dependency preparation."
+          fi
+
       # Explicit prompt -> automation mode, NOT default tag mode.
       # Explicit read-only github_token prevents the action from getting its own
       # GitHub App write token. No App publisher secret exists in this job.
@@ -122,10 +145,12 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends bubblewrap
+          sudo apt-get install -y --no-install-recommends bubblewrap socat
           command -v bwrap
           bwrap --version
-      - name: Claude proposes LOCAL worktree changes only
+          command -v socat
+      - id: claude
+        name: Claude proposes LOCAL worktree changes only
         uses: anthropics/claude-code-action@6fed3ca145920b639991cb756090506e1bcaf515 # v1
         with:
           github_token: ${{ github.token }}
@@ -139,26 +164,78 @@ jobs:
             push, create a PR, merge, deploy, or change any security policy.
             Never modify .github/, infra/, deploy/, tools/autopilot/,
             .claude/, .mcp.json, AGENTS.md, or CLAUDE.md.
+            Run focused tests/lint/typecheck/build locally when applicable;
+            all Bash commands must run inside the strict sandbox, with NO
+            network access and NO unsandboxed retry. Do not request bypass.
+            If a test requires network, customer credentials, production,
+            or sandbox relaxation, report the blocker and stop.
             If requirements are ambiguous, stop without changes.
           settings: |
-            {"permissions":{"deny":[
-              "Bash","WebFetch","WebSearch",
-              "Edit(.github/**)","Edit(infra/**)","Edit(deploy/**)",
-              "Edit(tools/autopilot/**)","Edit(.claude/**)",
-              "Edit(**/AGENTS.md)","Edit(**/CLAUDE.md)","Edit(.mcp.json)"
-            ]}}
+            {
+              "sandbox": {
+                "enabled": true,
+                "failIfUnavailable": true,
+                "allowUnsandboxedCommands": false,
+                "autoAllowBashIfSandboxed": true,
+                "network": {
+                  "allowedDomains": []
+                },
+                "filesystem": {
+                  "denyRead": [
+                    "~/.config/gh",
+                    "~/.ssh",
+                    "~/.aws",
+                    "~/.claude",
+                    "/proc/self/environ",
+                    "/proc/*/environ"
+                  ],
+                  "denyWrite": [
+                    "${{ github.workspace }}/.github",
+                    "${{ github.workspace }}/.claude",
+                    "${{ github.workspace }}/infra",
+                    "${{ github.workspace }}/deploy",
+                    "${{ github.workspace }}/tools/autopilot"
+                  ]
+                },
+                "credentials": {
+                  "envVars": [
+                    {"name":"GITHUB_TOKEN","mode":"deny"},
+                    {"name":"GH_TOKEN","mode":"deny"},
+                    {"name":"CLAUDE_CODE_OAUTH_TOKEN","mode":"deny"},
+                    {"name":"BUILDER_PUBLISHER_APP_PRIVATE_KEY","mode":"deny"}
+                  ]
+                }
+              },
+              "permissions": {
+                "deny": [
+                  "WebFetch","WebSearch",
+                  "Read(//proc/**)","Read(~/.claude/**)",
+                  "Read(~/.config/gh/**)","Read(~/.ssh/**)",
+                  "Edit(.github/**)","Edit(infra/**)","Edit(deploy/**)",
+                  "Edit(tools/autopilot/**)","Edit(.claude/**)",
+                  "Edit(**/AGENTS.md)","Edit(**/CLAUDE.md)","Edit(.mcp.json)"
+                ]
+              }
+            }
           claude_args: >-
-            --max-turns 50
-            --allowedTools "Read,Glob,Grep,Edit,Write"
-            --disallowedTools "Bash,WebFetch,WebSearch"
+            --max-turns 80
+            --allowedTools "Read,Glob,Grep,Edit,Write,Bash"
+            --disallowedTools "WebFetch,WebSearch"
 
+      - name: Agent failure classification (no writes, no secret output)
+        if: failure()
+        shell: bash
+        run: |
+          echo "::error::BUILDER_AGENT_FAILED: no patch may be published; inspect Claude step for installation, strict sandbox, denied tool or turn-limit causes."
+          echo "BUILDER_AGENT_FAILED (unverified root cause)" >> "$GITHUB_STEP_SUMMARY"
       - name: Produce UNTRUSTED patch, never push from this job
         shell: bash
         run: |
           set -euo pipefail
           git add -A
           git diff --cached --quiet && {
-            echo "::error::No local changes"; exit 1;
+            echo "::error::NO_PATCH: Claude produced no local changes; inspect agent logs for tool denials, test failures or exhausted turns."
+            exit 1
           }
           git diff --cached --binary --no-ext-diff --no-renames > "$RUNNER_TEMP/proposed.patch"
           test -s "$RUNNER_TEMP/proposed.patch"
