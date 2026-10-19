@@ -324,3 +324,34 @@ test('structured status validator fails closed on missing, malformed, inconsiste
     rmSync(folder, { recursive: true, force: true });
   }
 });
+
+
+test('Builder runner must prove strict isolated network namespace before Claude (R3 #29)', () => {
+  assert.equal(agent['runs-on'], 'ubuntu-22.04', 'use only proven compatible hosted runner');
+  const install = agent.steps.find(s => s.name === 'Install bubblewrap for isolated Claude subprocesses');
+  const probe = agent.steps.find(s => s.name === 'Verify strict bwrap network sandbox before Claude');
+  const claude = agent.steps.find(s => s.id === 'claude');
+  const publishToken = publish.steps.find(s => s.name?.startsWith('Mint limited publisher token'));
+  assert.ok(install && probe && claude && publishToken);
+  assert.ok(agent.steps.indexOf(install) < agent.steps.indexOf(probe));
+  assert.ok(agent.steps.indexOf(probe) < agent.steps.indexOf(claude));
+  for(const expected of [
+    'set -euo pipefail',
+    'timeout 15s bwrap',
+    '--unshare-user --unshare-net',
+    'test "$sandbox_net" != "$HOST_NET"',
+    'grep -q "lo:" /proc/net/dev',
+    'BWRAP_SANDBOX_NAMESPACE_READY'
+  ]) assert.ok(probe.run.includes(expected), expected);
+  assert.doesNotMatch(probe.run, /sysctl\s+-w|--share-net|sudo|allowUnsandboxedCommands|--cap-add/);
+  assert.equal(probe.env?.CLAUDE_CODE_OAUTH_TOKEN, undefined);
+  assert.equal(probe.env?.BUILDER_PUBLISHER_APP_PRIVATE_KEY, undefined);
+  assert.equal(agent.permissions.contents, 'read');
+  assert.equal(agent.permissions['pull-requests'], 'read');
+  assert.ok(!JSON.stringify(agent).includes('secrets.BUILDER_PUBLISHER_APP_PRIVATE_KEY'));
+  const settings = JSON.parse(claude.with.settings);
+  assert.equal(settings.sandbox.enabled, true);
+  assert.equal(settings.sandbox.failIfUnavailable, true);
+  assert.equal(settings.sandbox.allowUnsandboxedCommands, false);
+  assert.deepEqual(settings.sandbox.network.allowedDomains, []);
+});
