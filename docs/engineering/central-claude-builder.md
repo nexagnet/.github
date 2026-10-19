@@ -34,10 +34,15 @@ Replace APPROVED_FULL_40_CHAR_SHA with a real reviewed immutable commit after th
       pull-requests: read
     jobs:
       builder:
+        # Cheap pre-filter only; the central preflight is the authority. GitHub
+        # expression string comparison is case-insensitive and cannot trim, so this
+        # is intentionally stricter-or-equal: whole-body match of the two commands.
+        # Do NOT declare `concurrency:` here: the called workflow owns the group.
         if: >-
           github.actor == 'phungtienviet14-sketch' &&
+          github.event.sender.type == 'User' &&
           github.event.issue.pull_request == null &&
-          contains(github.event.comment.body, '@claude')
+          contains(fromJSON('["@claude","@claude retry"]'), github.event.comment.body)
         uses: nexagnet/.github/.github/workflows/claude-builder.yml@APPROVED_FULL_40_CHAR_SHA
         with:
           issue_number: ${{ github.event.issue.number }}
@@ -45,6 +50,60 @@ Replace APPROVED_FULL_40_CHAR_SHA with a real reviewed immutable commit after th
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           BUILDER_PUBLISHER_APP_ID: ${{ secrets.BUILDER_PUBLISHER_APP_ID }}
           BUILDER_PUBLISHER_APP_PRIVATE_KEY: ${{ secrets.BUILDER_PUBLISHER_APP_PRIVATE_KEY }}
+
+## Owner command syntax, retry policy and duplicate protection (R3 #33)
+
+Only two comments start a Builder, and only when the WHOLE comment is exactly the
+command (trailing whitespace ignored; leading text, other lines, code spans, fences,
+quotes, bold, links, case variants, `@claudette`-style look-alikes never match):
+
+| Comment | Meaning | Accepted when |
+|---|---|---|
+| `@claude` | First attempt | no earlier owner command on the Issue AND no Builder PR (any state) in `claude/issue-<N>-*` |
+| `@claude retry` | Sanctioned retry after `BLOCKED` / `NO_PATCH` / a closed-unmerged Draft | at least one earlier command, fewer than 3 earlier commands, no open and no merged Builder PR |
+
+A report that merely mentions `@claude` is never a command. Bot or app comments, PR
+threads, edited comments and workflow re-runs (`run_attempt > 1`) are rejected. The
+live comment is re-fetched and must match the event (same id, human `User` owner, same
+body). Authority is checked twice: a cheap consumer pre-filter, then the trusted central
+preflight (the pre-filter is never the security boundary).
+
+**Attempt ledger.** The ledger is the owner's own earlier command comments on the Issue
+(human `User` author, exact command body), paginated, ordered by comment id. A rejected
+duplicate command still consumes budget, so the cap of 3 attempts per Issue is
+auditable from the comment thread alone. A revised Task Contract is a new Issue. The owner
+could delete command comments to reset the ledger; that is an owner-controlled act, not an
+automation path.
+
+**Duplicate-PR guard.** `bot_pr_guard` lists all same-repository PRs (all states, fully
+paginated, `per_page=100`) whose head branch matches `claude/issue-<N>-<run>-<attempt>`,
+the exact shape Reviewer and Repair already parse. Forks and other Issues never match.
+Any 403, rate-limit or unparsable page fails closed. It runs (1) in preflight,
+(2) in the publisher with the read-only token before any write token is minted and
+(3) again immediately before the first push with the write token. Repair keeps pushing
+to the same PR branch, so an open repaired PR keeps blocking new commands.
+
+**Concurrency and what it does and does not guarantee.** The reusable workflow declares one
+workflow-level group, `nexagnet-builder-<repo>-issue-<N>`, `cancel-in-progress: false`.
+Callers and child jobs must not reuse that name (self-cancel/deadlock). GitHub keeps one
+running plus one pending run per group and cancels further pending runs, ordering of pending
+runs is not guaranteed, and the lock does not cross repositories. Therefore correctness does
+not depend on it. Two publishers that pass every check before either PR exists are resolved
+by a deterministic tie-break: after creating its Draft each publisher lists the namespace and
+the lowest open PR number wins; every other publisher closes only its own PR, deletes only
+its own branch and fails the run. Residual risk: that tie-break assumes GitHub's PR list is
+read-your-own-write consistent; if it is not, `PUBLISH_STATE_UNKNOWN` fails the run and a
+human closes the extra Draft (never merged: Drafts need Reviewer, exact-head CI and the owner).
+
+Audit trail: the PR body records `command`, `attempt` and the trigger comment URL.
+Rejections are single-line `::error::` codes: `INTENT_REJECTED`, `REPLAY_REJECTED`,
+`COMMENT_CHANGED`, `DUPLICATE_COMMAND_REJECTED`, `EXISTING_PR_REJECTED`,
+`RETRY_WITHOUT_ATTEMPT`, `RETRY_BUDGET_EXHAUSTED`, `OPEN_PR_REJECTED`,
+`MERGED_PR_REJECTED`, `PR_LOOKUP_FAILED`, `LEDGER_LOOKUP_FAILED`,
+`DUPLICATE_PR_REJECTED`, `DUPLICATE_PUBLISH_RACE_LOST`.
+
+Consumers on an older pinned SHA keep the old substring behaviour until they re-pin in a
+separate, owner-approved R3 consumer PR.
 
 ## Security invariants and limitations
 
