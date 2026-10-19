@@ -87,7 +87,10 @@ jobs:
   agent:
     name: Claude on consumer code (read-only GitHub token)
     needs: preflight
-    runs-on: ubuntu-24.04
+    # GitHub-hosted ubuntu-24.04 currently fails isolated bwrap loopback (EPERM).
+    # The ubuntu-22.04 hosted image passed a real separate-netns probe, Issue #29.
+    # Never relax AppArmor/sysctl or fall back to unsandboxed Bash.
+    runs-on: ubuntu-22.04
     timeout-minutes: 120
     concurrency:
       group: nexagnet-builder-${{ github.repository }}-${{ inputs.issue_number }}
@@ -149,6 +152,23 @@ jobs:
           command -v bwrap
           bwrap --version
           command -v socat
+      - name: Verify strict bwrap network sandbox before Claude
+        shell: bash
+        run: |
+          set -euo pipefail
+          host_net="$(readlink /proc/self/ns/net)"
+          # shellcheck disable=SC2016
+          HOST_NET="$host_net" timeout 15s bwrap \
+            --unshare-user --unshare-net \
+            --ro-bind / / --dev-bind /dev /dev --proc /proc --tmpfs /tmp \
+            -- /bin/bash -eu -c '
+              sandbox_net="$(readlink /proc/self/ns/net)"
+              test "$sandbox_net" != "$HOST_NET"
+              grep -q "lo:" /proc/net/dev
+              ! grep -Eq "eth[0-9]+:" /proc/net/dev
+              echo "BWRAP_SANDBOX_NAMESPACE_READY"
+            '
+
       - id: claude
         name: Claude proposes LOCAL worktree changes only
         uses: anthropics/claude-code-action@6fed3ca145920b639991cb756090506e1bcaf515 # v1
