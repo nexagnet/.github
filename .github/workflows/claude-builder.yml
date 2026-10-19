@@ -546,12 +546,72 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
 
+      # Durable at-most-one guarantee (R3 #33). Creating a git ref fails with 422 when the name exists, so exactly one
+      # publisher can own a generation (= number of earlier Builder PRs for this Issue) however many runners passed
+      # every check together. The claim is taken BEFORE any push or PR and does not depend on a loser surviving to run a
+      # later cleanup step: a runner killed or cancelled at any point leaves at most the one PR its claim allows.
+      # A claim whose holder died before opening a PR fails closed (PUBLISH_CLAIM_REJECTED); the owner releases it by
+      # deleting that single ref (docs/engineering/central-claude-builder.md). Uses the publisher token already minted
+      # (contents: write); no new permission.
+      - id: claim
+        name: Claim the single publish slot for this Issue (atomic, before any push)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.publisher.outputs.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          BASE_SHA: ${{ needs.preflight.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2034 # each caller reads a subset of the PR_* results
+          bot_pr_guard() {
+            local pages stats
+            pages="$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls?state=all&per_page=100")" || {
+              echo "::error::PR_LOOKUP_FAILED: cannot list pull requests; failing closed"; return 1;
+            }
+            stats="$(jq -s -c --arg repo "$GITHUB_REPOSITORY" \
+              --arg re "^claude/issue-${ISSUE_NUMBER}-[1-9][0-9]*-[1-9][0-9]*\$" '
+              (add // [])
+              | map(select((.head.ref | test($re))
+                  and ((.head.repo.full_name // "" | ascii_downcase) == ($repo | ascii_downcase))))
+              | {open: (map(select(.state == "open")) | length),
+                 merged: (map(select(.merged_at != null)) | length),
+                 total: length,
+                 open_min: (map(select(.state == "open") | .number) | min)}
+            ' <<< "$pages")" || {
+              echo "::error::PR_LOOKUP_FAILED: unparsable pull request list; failing closed"; return 1;
+            }
+            PR_OPEN="$(jq -r .open <<< "$stats")"
+            PR_MERGED="$(jq -r .merged <<< "$stats")"
+            PR_TOTAL="$(jq -r .total <<< "$stats")"
+            PR_OPEN_MIN="$(jq -r '.open_min // empty' <<< "$stats")"
+          }
+          [[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]*$ ]]
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          bot_pr_guard
+          if [ "$PR_OPEN" -ne 0 ] || [ "$PR_MERGED" -ne 0 ]; then
+            echo "::error::DUPLICATE_PR_REJECTED: Builder PR already open or merged for Issue #$ISSUE_NUMBER"; exit 1
+          fi
+          [[ "$PR_TOTAL" =~ ^[0-9]+$ ]]
+          claim="refs/builder-claims/issue-${ISSUE_NUMBER}-gen-${PR_TOTAL}"
+          [[ "$claim" =~ ^refs/builder-claims/issue-[1-9][0-9]*-gen-[0-9]+$ ]]
+          git check-ref-format "$claim" >/dev/null
+          err="$(mktemp)"
+          if ! gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="$claim" -f sha="$BASE_SHA" >/dev/null 2>"$err"; then
+            if grep -q 'Reference already exists' "$err"; then
+              echo "::error::PUBLISH_CLAIM_REJECTED: another publisher owns $claim (live or stranded); failing closed"; exit 1
+            fi
+            echo "::error::PUBLISH_CLAIM_FAILED: cannot create $claim; failing closed"; exit 1
+          fi
+          echo "ref=$claim" >> "$GITHUB_OUTPUT"
+          echo "PUBLISH_CLAIMED: $claim"
+
       - id: draft
         name: Publish only a DRAFT PR, never merge or deploy
         shell: bash
         env:
           GH_TOKEN: ${{ steps.publisher.outputs.token }}
           ISSUE_NUMBER: ${{ inputs.issue_number }}
+          CLAIM_REF: ${{ steps.claim.outputs.ref }}
           BASE_SHA: ${{ needs.preflight.outputs.base_sha }}
           BASE_BRANCH: ${{ needs.preflight.outputs.base_branch }}
           RISK: ${{ needs.preflight.outputs.risk }}
@@ -586,6 +646,8 @@ jobs:
           [[ "$COMMAND" =~ ^(run|retry)$ ]]
           [[ "$ATTEMPT" =~ ^[1-3]$ ]]
           [[ "$COMMENT_ID" =~ ^[1-9][0-9]*$ ]]
+          # No push or PR without the atomic claim taken by the previous step (fails closed when it is absent).
+          [[ "$CLAIM_REF" =~ ^refs/builder-claims/issue-${ISSUE_NUMBER}-gen-[0-9]+$ ]]
           # Last look immediately before the first push with the write token.
           bot_pr_guard
           if [ "$PR_OPEN" -ne 0 ] || [ "$PR_MERGED" -ne 0 ]; then
@@ -622,9 +684,10 @@ jobs:
             echo "branch=$branch"
           } >> "$GITHUB_OUTPUT"
 
-      # Defence in depth when two publishers pass every check before either PR
-      # exists: the lowest open PR number in this Issue's Builder namespace wins and
-      # every later one closes ITSELF (never another PR) and deletes its own branch.
+      # Defence in depth only. The atomic claim step above is what guarantees at most one Draft; this step
+      # additionally lets the lowest open PR number in this Issue's Builder namespace win if a PR somehow exists
+      # next to another (e.g. a manually opened one), and every later one closes ITSELF (never another PR) and
+      # deletes its own branch. It is NOT relied on for the invariant: it cannot run if the runner is killed.
       - name: Resolve publish race deterministically (lowest PR number wins)
         shell: bash
         env:

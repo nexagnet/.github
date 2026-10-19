@@ -119,6 +119,31 @@ if (/^repos\/[^/]+\/[^/]+$/.test(route) && jqExpr === '.default_branch') {
     fs.writeFileSync(`${dir}/pulls-state.json`, JSON.stringify(state));
   });
   process.stdout.write('{}\n');
+} else if (/^repos\/[^/]+\/[^/]+\/git\/refs$/.test(route) && method === 'POST') {
+  // Atomic exclusive ref creation, like GitHub: 422 "Reference already exists" when the name is taken.
+  if (failing.includes('claim')) die('gh: Internal Server Error (HTTP 500)');
+  if (!/^refs\/[^/]+\/.+/.test(fields.ref || '') || !/^[0-9a-f]{40}$/.test(fields.sha || '')) die('gh: Validation Failed (HTTP 422)');
+  const taken = withLock(() => {
+    const file = `${dir}/refs-state.json`;
+    const refs = exists('refs-state.json') ? JSON.parse(read('refs-state.json')) : {};
+    if (Object.hasOwn(refs, fields.ref)) return true;
+    refs[fields.ref] = fields.sha;
+    fs.writeFileSync(file, JSON.stringify(refs));
+    return false;
+  });
+  if (taken) die('gh: Reference already exists (HTTP 422)');
+  process.stdout.write(JSON.stringify({ ref: fields.ref, object: { sha: fields.sha } }) + '\n');
+} else if ((m = route.match(/^repos\/[^/]+\/[^/]+\/git\/refs\/(builder-claims\/.+)$/)) && method === 'DELETE') {
+  // Owner release of a stranded claim.
+  const removed = withLock(() => {
+    const refs = exists('refs-state.json') ? JSON.parse(read('refs-state.json')) : {};
+    if (!Object.hasOwn(refs, `refs/${m[1]}`)) return false;
+    delete refs[`refs/${m[1]}`];
+    fs.writeFileSync(`${dir}/refs-state.json`, JSON.stringify(refs));
+    return true;
+  });
+  if (!removed) die('gh: Reference does not exist (HTTP 422)');
+  process.stdout.write('\n');
 } else if (/^repos\/[^/]+\/[^/]+\/git\/refs\/heads\//.test(route) && method === 'DELETE') {
   fs.appendFileSync(`${dir}/deleted-refs.log`, route + '\n');
   process.stdout.write('\n');

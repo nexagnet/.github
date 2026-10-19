@@ -88,19 +88,43 @@ workflow-level group, `nexagnet-builder-<repo>-issue-<N>`, `cancel-in-progress: 
 Callers and child jobs must not reuse that name (self-cancel/deadlock). GitHub keeps one
 running plus one pending run per group and cancels further pending runs, ordering of pending
 runs is not guaranteed, and the lock does not cross repositories. Therefore correctness does
-not depend on it. Two publishers that pass every check before either PR exists are resolved
-by a deterministic tie-break: after creating its Draft each publisher lists the namespace and
-the lowest open PR number wins; every other publisher closes only its own PR, deletes only
-its own branch and fails the run. Residual risk: that tie-break assumes GitHub's PR list is
-read-your-own-write consistent; if it is not, `PUBLISH_STATE_UNKNOWN` fails the run and a
-human closes the extra Draft (never merged: Drafts need Reviewer, exact-head CI and the owner).
+not depend on it.
+
+**At-most-one Draft is enforced by an atomic claim, not by cleanup.** Right after the restricted
+publisher token is minted and BEFORE any push or PR, the `claim` step creates the git ref
+`refs/builder-claims/issue-<N>-gen-<G>` at the frozen base SHA, where `<G>` is the number of earlier Builder
+PRs (any state) for that Issue. Creating a ref fails with HTTP 422 when the name exists, so exactly one
+publisher can own a generation however many runners passed every check together; the draft step refuses to run
+without a matching `CLAIM_REF`. Because the claim is taken first, a runner that is cancelled, times out, crashes
+or gets a 403 at ANY later point leaves at most the single PR its claim allows; no loser has to survive to run
+a later step. It uses the already-minted publisher token (`contents: write`); no permission is added, and the
+claim step never pushes, edits or deletes anything.
+
+- **Holder killed after its PR exists:** that one Draft stays open and blocks every later command
+  (`DUPLICATE_PR_REJECTED`). Close it to retry; the retry takes generation `G+1`.
+- **Holder killed after claiming but before any PR:** only the claim is stranded. Every later attempt for that
+  generation fails closed (`PUBLISH_CLAIM_REJECTED`) and no PR is created. Owner recovery is one explicit act:
+  delete exactly that ref, e.g. `gh api -X DELETE repos/<owner>/<repo>/git/refs/builder-claims/issue-<N>-gen-<G>`,
+  then retry. Safety is preferred over liveness; claims are never auto-released.
+- **Ref API error** (500, 403, rate limit): `PUBLISH_CLAIM_FAILED`, no push, no PR.
+- Claims are never deleted by the workflow (at most 3 per Issue). The post-PR tie-break stays only as defence in
+  depth (for example a manually opened PR in the namespace); it is not relied on, because it cannot run when the
+  runner is killed.
+
+Evidence level: the claim, kill-after-POST, kill-after-claim and recovery paths are executed by
+`tests/claude-builder-intent-idempotency.test.cjs` against a fake GitHub that implements exclusive ref creation
+like the real API (SIGKILLed publisher processes, barrier so all racers pass every guard together). That proves the
+shell logic. It does NOT prove live GitHub behaviour: that a non-branch ref under `refs/builder-claims/` can be
+created with the publisher App token, and that GitHub actually returns 422 for a duplicate, remain
+`NOT_PROVEN` until the consumer run after the owner-controlled R3 merge; do not conflate the mocked race with live
+GitHub Actions serialization proof.
 
 Audit trail: the PR body records `command`, `attempt` and the trigger comment URL.
 Rejections are single-line `::error::` codes: `INTENT_REJECTED`, `REPLAY_REJECTED`,
 `COMMENT_CHANGED`, `DUPLICATE_COMMAND_REJECTED`, `EXISTING_PR_REJECTED`,
 `RETRY_WITHOUT_ATTEMPT`, `RETRY_BUDGET_EXHAUSTED`, `OPEN_PR_REJECTED`,
 `MERGED_PR_REJECTED`, `PR_LOOKUP_FAILED`, `LEDGER_LOOKUP_FAILED`,
-`DUPLICATE_PR_REJECTED`, `DUPLICATE_PUBLISH_RACE_LOST`.
+`DUPLICATE_PR_REJECTED`, `PUBLISH_CLAIM_REJECTED`, `PUBLISH_CLAIM_FAILED`, `DUPLICATE_PUBLISH_RACE_LOST`.
 
 Consumers on an older pinned SHA keep the old substring behaviour until they re-pin in a
 separate, owner-approved R3 consumer PR.
