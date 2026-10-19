@@ -546,6 +546,63 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
 
+      # Durable, fail-closed publish claim. Taken BEFORE any push/PR POST, so at-most-one live
+      # Draft never depends on a losing runner surviving to clean up. refs/tags/claude-claim/
+      # issue-<N>/g<K> is an append-only chain: creating a Git ref is atomic server-side, so two
+      # racers computing the same K yield exactly one winner (the other gets CLAIM_LOST). A claim
+      # carries its creation epoch and expires after 1200 s, longer than this job's 15 min
+      # timeout, so a crashed claimant can neither block forever nor act after expiry. Claims
+      # are never deleted (no takeover race); a stale chain only advances to the next K.
+      - id: claim
+        name: Claim the exclusive publish slot (atomic, self-expiring)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.publisher.outputs.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          BASE_SHA: ${{ needs.preflight.outputs.base_sha }}
+          ATTEMPT: ${{ needs.preflight.outputs.attempt }}
+        run: |
+          set -euo pipefail
+          ttl=1200
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$ATTEMPT" =~ ^[1-3]$ ]]
+          prefix="claude-claim/issue-${ISSUE_NUMBER}/"
+          now="$(date +%s)"
+          pages="$(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$prefix")" || {
+            echo "::error::CLAIM_LOOKUP_FAILED: cannot list claims; failing closed"; exit 1;
+          }
+          read -r max_k latest_sha < <(jq -s -r --arg p "refs/tags/$prefix" '
+            (add // [])
+            | map(select(.ref | test("^" + $p + "g[1-9][0-9]*$"))
+                | {k: (.ref | sub(".*/g"; "") | tonumber), sha: .object.sha})
+            | (max_by(.k) // {k: 0, sha: ""}) | "\(.k) \(.sha)"' <<< "$pages") || {
+            echo "::error::CLAIM_LOOKUP_FAILED: unparsable claim list; failing closed"; exit 1;
+          }
+          [[ "$max_k" =~ ^[0-9]+$ ]]
+          if [ "$max_k" -gt 0 ]; then
+            tag="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$latest_sha")" || {
+              echo "::error::CLAIM_LOOKUP_FAILED: cannot read latest claim; failing closed"; exit 1;
+            }
+            epoch="$(jq -r '.message // ""' <<< "$tag" | sed -n 's/^epoch=\([0-9][0-9]*\) .*/\1/p')"
+            if ! [[ "$epoch" =~ ^[0-9]+$ ]] || [ $((now - epoch)) -lt "$ttl" ]; then
+              echo "::error::CLAIM_HELD: another publisher holds Issue #$ISSUE_NUMBER (g$max_k) or its claim is unreadable; failing closed"; exit 1
+            fi
+          fi
+          k=$((max_k + 1))
+          tag_sha="$(gh api -X POST "repos/$GITHUB_REPOSITORY/git/tags" \
+            -f tag="claude-claim-issue-${ISSUE_NUMBER}-g$k" \
+            -f message="epoch=$now run=$GITHUB_RUN_ID attempt=$ATTEMPT" \
+            -f object="$BASE_SHA" -f type=commit --jq .sha)" || {
+            echo "::error::CLAIM_CREATE_FAILED: cannot create claim tag; failing closed"; exit 1;
+          }
+          [[ "$tag_sha" =~ ^[0-9a-f]{40}$ ]]
+          gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="refs/tags/${prefix}g$k" -f sha="$tag_sha" > /dev/null || {
+            echo "::error::CLAIM_LOST: g$k already taken for Issue #$ISSUE_NUMBER; failing closed"; exit 1;
+          }
+          echo "claim_ref=refs/tags/${prefix}g$k" >> "$GITHUB_OUTPUT"
+          echo "CLAIM_ACQUIRED g$k for Issue #$ISSUE_NUMBER"
+
       - id: draft
         name: Publish only a DRAFT PR, never merge or deploy
         shell: bash
@@ -558,8 +615,10 @@ jobs:
           COMMAND: ${{ needs.preflight.outputs.command }}
           ATTEMPT: ${{ needs.preflight.outputs.attempt }}
           COMMENT_ID: ${{ needs.preflight.outputs.comment_id }}
+          CLAIM_REF: ${{ steps.claim.outputs.claim_ref }}
         run: |
           set -euo pipefail
+          [[ "$CLAIM_REF" =~ ^refs/tags/claude-claim/issue-${ISSUE_NUMBER}/g[1-9][0-9]*$ ]]
           # shellcheck disable=SC2034 # each caller reads a subset of the PR_* results
           bot_pr_guard() {
             local pages stats

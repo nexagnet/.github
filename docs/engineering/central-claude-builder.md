@@ -88,12 +88,30 @@ workflow-level group, `nexagnet-builder-<repo>-issue-<N>`, `cancel-in-progress: 
 Callers and child jobs must not reuse that name (self-cancel/deadlock). GitHub keeps one
 running plus one pending run per group and cancels further pending runs, ordering of pending
 runs is not guaranteed, and the lock does not cross repositories. Therefore correctness does
-not depend on it. Two publishers that pass every check before either PR exists are resolved
-by a deterministic tie-break: after creating its Draft each publisher lists the namespace and
-the lowest open PR number wins; every other publisher closes only its own PR, deletes only
-its own branch and fails the run. Residual risk: that tie-break assumes GitHub's PR list is
-read-your-own-write consistent; if it is not, `PUBLISH_STATE_UNKNOWN` fails the run and a
-human closes the extra Draft (never merged: Drafts need Reviewer, exact-head CI and the owner).
+not depend on it.
+
+**Durable publish claim (the at-most-one-Draft guarantee).** Before any push or PR POST, the
+publisher takes an exclusive claim: `refs/tags/claude-claim/issue-<N>/g<K>` (an annotated tag
+whose message is `epoch=<n> run=<id> attempt=<a>`). `K` is one more than the highest existing
+claim. Creating a Git ref is atomic on the server, so publishers that compute the same `K`
+produce exactly one winner and the others fail with `CLAIM_LOST`. If the latest claim is
+younger than 1200 s, or unreadable, or has no epoch, the publisher fails with `CLAIM_HELD`
+(fail closed). The TTL exceeds the 15 min publish-job timeout, so a crashed, cancelled or
+timed-out claimant can never act after its claim expires and the chain advances to the next
+`K`. Claims are never deleted (no takeover race) and the chain is bounded by the 3-attempt
+ledger. Nothing here depends on a losing runner surviving: the claim precedes the PR, so a
+runner killed right after the claim leaves zero PRs, and a runner killed right after its POST
+leaves exactly one open Draft that the claim and the open-PR guard protect. Executable
+fault-injection tests cover kill-after-claim (held, then recovery after expiry),
+kill-after-POST before the tie-break, a 4-way claim race, API 403s and forged claim messages.
+
+The deterministic tie-break (lowest open PR number wins; a loser closes only its own PR and
+branch) remains as defence in depth. Requirements and limits: the publisher App needs
+`contents: write`, which it already has, to create tags; a consumer ruleset that forbids tag
+creation makes the publisher fail closed (`CLAIM_CREATE_FAILED`); it never widens permissions.
+A live claim blocks a retry for up to 20 minutes after a mid-publish crash. This is verified
+with a mocked GitHub, not live Actions serialization; the live synthetic proof after the
+consumer rollout remains required.
 
 Audit trail: the PR body records `command`, `attempt` and the trigger comment URL.
 Rejections are single-line `::error::` codes: `INTENT_REJECTED`, `REPLAY_REJECTED`,

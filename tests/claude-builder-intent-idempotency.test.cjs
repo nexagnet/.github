@@ -314,6 +314,159 @@ test('concurrent publishers: exactly one open Draft survives (lowest PR number),
   }
 });
 
+// ---------------------------------------------------------------------------------------------
+// Durable claim (repair of the #34 review blocker): at-most-one live Draft must not depend on a
+// losing runner surviving to run the tie-break step.
+
+const claimScript = h.jobs.publish.steps.find((s) => s.id === 'claim').run;
+const T0 = 1_800_000_000;
+const claimEnv = (i, extra = {}) => ({
+  BASE_SHA: 'a'.repeat(40), ATTEMPT: '1', GITHUB_RUN_ID: String(7000 + i), FAKE_NOW: String(T0), ...extra,
+});
+
+test('claim step: ordered between token mint and draft, never deletes, expiry outlives the publish job', () => {
+  const steps = h.jobs.publish.steps;
+  const idx = (pred) => steps.findIndex(pred);
+  assert.ok(idx((s) => s.id === 'publisher') < idx((s) => s.id === 'claim'));
+  assert.ok(idx((s) => s.id === 'claim') < idx((s) => s.id === 'draft'));
+  assert.equal(steps.find((s) => s.id === 'claim').env.GH_TOKEN, '${{ steps.publisher.outputs.token }}');
+  assert.match(draft, /CLAIM_REF/);
+  assert.ok(draft.indexOf('CLAIM_REF') < draft.indexOf('git push'));
+  assert.doesNotMatch(claimScript, /-X DELETE|-X PATCH|git push|pulls/);
+  const ttl = Number(claimScript.match(/ttl=(\d+)/)[1]);
+  assert.ok(ttl > h.jobs.publish['timeout-minutes'] * 60, 'a dead claimant can never act after its claim expires');
+});
+
+function claimOutcome(world, extra = {}, i = 0) {
+  return h.runScript(world, claimScript, claimEnv(i, extra));
+}
+
+test('claim: first publisher acquires g1; an unexpired claim blocks; an expired one advances to g2', () => {
+  const world = h.makeWorld({});
+  try {
+    const first = claimOutcome(world);
+    assert.equal(first.ok, true, first.stderr);
+    assert.equal(first.outputs.claim_ref, 'refs/tags/claude-claim/issue-12/g1');
+    const held = claimOutcome(world, { FAKE_NOW: String(T0 + 1199) }, 1);
+    assert.equal(held.ok, false);
+    assert.match(held.stderr, /CLAIM_HELD/);
+    const next = claimOutcome(world, { FAKE_NOW: String(T0 + 1200) }, 2);
+    assert.equal(next.ok, true, next.stderr);
+    assert.equal(next.outputs.claim_ref, 'refs/tags/claude-claim/issue-12/g2');
+    // other Issues have their own chain (issue 12 vs 120 never collide)
+    const other = h.runScript(world, claimScript, { ...claimEnv(3), ISSUE_NUMBER: '120' });
+    assert.equal(other.outputs.claim_ref, 'refs/tags/claude-claim/issue-120/g1');
+  } finally {
+    world.cleanup();
+  }
+});
+
+test('claim fails closed on API errors and unreadable or forged claim messages', () => {
+  for (const fail of ['claims', 'claim-create']) {
+    const world = h.makeWorld({});
+    try {
+      const r = claimOutcome(world, { FAKE_GH_FAIL: fail });
+      assert.equal(r.ok, false, fail);
+      assert.match(r.stderr, /CLAIM_(LOOKUP|CREATE)_FAILED/, fail);
+    } finally { world.cleanup(); }
+  }
+  const world = h.makeWorld({});
+  try {
+    assert.equal(claimOutcome(world).ok, true);
+    const unreadable = claimOutcome(world, { FAKE_GH_FAIL: 'claim-read', FAKE_NOW: String(T0 + 99999) }, 1);
+    assert.equal(unreadable.ok, false, 'cannot read the latest claim: do not assume it is stale');
+    const statePath = join(world.dir, 'claims-state.json');
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    for (const tag of Object.values(state.tags)) tag.message = 'forged without epoch';
+    h.writeFileSync(statePath, JSON.stringify(state));
+    const forged = claimOutcome(world, { FAKE_NOW: String(T0 + 99999) }, 2);
+    assert.equal(forged.ok, false, 'claim without an epoch is never treated as expired');
+    assert.match(forged.stderr, /CLAIM_HELD/);
+  } finally { world.cleanup(); }
+});
+
+// A publisher flow = pre-mint guard -> claim -> create Draft -> (tie-break). `killAfter` simulates
+// the runner being killed/cancelled/timed out (SIGKILL: no step after it runs, no cleanup).
+function writeFlow(world, i, { killAfter = null, tieBreak = true } = {}) {
+  const file = join(world.dir, `flow-${i}.sh`);
+  const branch = BRANCH(12, 9000 + i);
+  h.writeFileSync(join(world.dir, 'claim.sh'), claimScript);
+  h.writeFileSync(join(world.dir, 'premint.sh'), premint);
+  h.writeFileSync(join(world.dir, 'tiebreak.sh'), tiebreak);
+  h.writeFileSync(file, [
+    'set -euo pipefail',
+    `bash "${join(world.dir, 'premint.sh')}"`,
+    `bash "${join(world.dir, 'claim.sh')}"`,
+    killAfter === 'claim' ? 'kill -KILL $$' : ':',
+    `created="$(gh api -X POST "repos/$GITHUB_REPOSITORY/pulls" -f title=t -f head="${branch}" -f base=main -F draft=true -f body=b)"`,
+    killAfter === 'post' ? 'kill -KILL $$' : ':',
+    'export PR_NUMBER="$(jq -r .number <<< "$created")"',
+    `export BRANCH="${branch}"`,
+    tieBreak ? `bash "${join(world.dir, 'tiebreak.sh')}"` : ':',
+  ].join('\n'));
+  return file;
+}
+const openPrs = (world) => JSON.parse(readFileSync(join(world.dir, 'pulls-state.json'), 'utf8')).prs.filter((p) => p.state === 'open');
+
+test('FAULT INJECTION: runner killed right after the PR POST, before the tie-break; the competing publisher cannot create a second Draft', async () => {
+  const world = h.makeWorld({ dynamicPulls: [] });
+  try {
+    // Both publishers pass the pre-mint guard together (nothing exists yet), then race for the claim.
+    const raceEnv = (i) => ({ ...claimEnv(i), FLOW_ID: String(i), BARRIER_N: '2', BARRIER_ON: 'claims' });
+    const [a, b] = await Promise.all([
+      h.spawnScript(world, writeFlow(world, 0, { killAfter: 'post' }), raceEnv(0)),
+      h.spawnScript(world, writeFlow(world, 1, { killAfter: 'post' }), raceEnv(1)),
+    ]);
+    const killed = [a, b].filter((r) => r.status === 137 || r.status === null);
+    const refused = [a, b].filter((r) => /CLAIM_(LOST|HELD)/.test(r.stderr));
+    assert.equal(killed.length, 1, 'exactly one publisher won the claim and was killed after its POST');
+    assert.equal(refused.length, 1, 'the other publisher was refused by the claim, not by cleanup');
+    assert.equal(openPrs(world).length, 1, 'exactly one open Draft although the tie-break step never ran');
+  } finally { world.cleanup(); }
+});
+
+test('FAULT INJECTION: 4 publishers race the claim; exactly one Draft, no tie-break needed', async () => {
+  const world = h.makeWorld({ dynamicPulls: [] });
+  try {
+    const results = await Promise.all([0, 1, 2, 3].map((i) =>
+      h.spawnScript(world, writeFlow(world, i, { tieBreak: false }), { ...claimEnv(i), FLOW_ID: String(i), BARRIER_N: '4', BARRIER_ON: 'claims' })));
+    assert.equal(results.filter((r) => r.ok).length, 1);
+    for (const r of results.filter((x) => !x.ok)) assert.match(r.stderr, /CLAIM_(LOST|HELD)/);
+    assert.equal(openPrs(world).length, 1);
+    const refs = Object.keys(JSON.parse(readFileSync(join(world.dir, 'claims-state.json'), 'utf8')).refs);
+    assert.deepEqual(refs, ['refs/tags/claude-claim/issue-12/g1'], 'one atomic winner, no leftover claim');
+  } finally { world.cleanup(); }
+});
+
+test('FAULT INJECTION: runner killed right after the claim, before any PR: no duplicate while held, automatic recovery after expiry', async () => {
+  const world = h.makeWorld({ dynamicPulls: [] });
+  try {
+    const dead = await h.spawnScript(world, writeFlow(world, 0, { killAfter: 'claim' }), claimEnv(0));
+    assert.ok(dead.status === 137 || dead.status === null, 'first publisher killed');
+    assert.equal(openPrs(world).length, 0, 'nothing was published');
+    const early = await h.spawnScript(world, writeFlow(world, 1), claimEnv(1, { FAKE_NOW: String(T0 + 600) }));
+    assert.equal(early.ok, false);
+    assert.match(early.stderr, /CLAIM_HELD/);
+    assert.equal(openPrs(world).length, 0, 'still no Draft while the dead claim is unexpired (fail closed)');
+    const recovered = await h.spawnScript(world, writeFlow(world, 2), claimEnv(2, { FAKE_NOW: String(T0 + 1300) }));
+    assert.equal(recovered.ok, true, recovered.stderr);
+    assert.equal(openPrs(world).length, 1, 'recovery produced exactly one Draft');
+  } finally { world.cleanup(); }
+});
+
+test('FAULT INJECTION: first publisher killed after its POST; a later publisher after claim expiry is stopped by the open-PR guard', async () => {
+  const world = h.makeWorld({ dynamicPulls: [] });
+  try {
+    const dead = await h.spawnScript(world, writeFlow(world, 0, { killAfter: 'post' }), claimEnv(0));
+    assert.ok(dead.status === 137 || dead.status === null);
+    assert.equal(openPrs(world).length, 1);
+    const later = await h.spawnScript(world, writeFlow(world, 1), claimEnv(1, { FAKE_NOW: String(T0 + 5000) }));
+    assert.equal(later.ok, false);
+    assert.match(later.stderr, /DUPLICATE_PR_REJECTED/);
+    assert.equal(openPrs(world).length, 1);
+  } finally { world.cleanup(); }
+});
+
 test('tie-break fails closed when own PR is not visible and validates its inputs', () => {
   const world = h.makeWorld({ dynamicPulls: [] });
   try {

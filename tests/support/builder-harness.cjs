@@ -48,6 +48,9 @@ function makeWorld({ ev = event(), iss = issue(), comments = [[]], pulls = [[]],
   mkdirSync(bin);
   writeFileSync(join(bin, 'gh'), `#!/bin/bash\nexec node "${fakeGh}" "$@"\n`, { mode: 0o755 });
   writeFileSync(join(dir, 'calls.log'), '');
+  writeFileSync(join(dir, 'claims-state.json'), JSON.stringify({ refs: {}, tags: {}, seq: 0 }));
+  // Controllable clock for claim expiry: `date +%s` honours FAKE_NOW, everything else is real.
+  writeFileSync(join(bin, 'date'), '#!/bin/bash\nif [ -n "${FAKE_NOW:-}" ] && [ "$1" = "+%s" ]; then echo "$FAKE_NOW"; else exec /bin/date "$@"; fi\n', { mode: 0o755 });
   writeFileSync(join(dir, 'event.json'), JSON.stringify(ev));
   writeFileSync(join(dir, 'issue.json'), JSON.stringify(iss));
   writeFileSync(join(dir, 'live-comment.json'), JSON.stringify(liveComment ?? live(ev)));

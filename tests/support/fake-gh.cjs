@@ -62,13 +62,13 @@ function withLock(fn) {
   try { return fn(); } finally { fs.rmdirSync(lock); }
 }
 
-function barrier() {
+function barrier(name) {
   const flow = process.env.FLOW_ID;
   const need = Number(process.env.BARRIER_N || 0);
-  if (!flow || !need || exists(`barrier-${flow}`)) return;
-  fs.writeFileSync(`${dir}/barrier-${flow}`, '');
+  if (!flow || !need || process.env.BARRIER_ON !== name || exists(`barrier-${name}-${flow}`)) return;
+  fs.writeFileSync(`${dir}/barrier-${name}-${flow}`, '');
   const started = Date.now();
-  while (fs.readdirSync(dir).filter((f) => f.startsWith('barrier-')).length < need) {
+  while (fs.readdirSync(dir).filter((f) => f.startsWith(`barrier-${name}-`)).length < need) {
     if (Date.now() - started > 15000) die('barrier timeout');
     sleep(3);
   }
@@ -91,7 +91,7 @@ if (/^repos\/[^/]+\/[^/]+$/.test(route) && jqExpr === '.default_branch') {
   if (failing.includes('pulls')) die('HTTP 403: rate limit exceeded');
   if (failing.includes('pulls-garbage')) { process.stdout.write('<html>not json</html>\n'); process.exit(0); }
   if (exists('pulls-state.json')) {
-    barrier();
+    barrier('pulls');
     emit(withLock(() => JSON.stringify(JSON.parse(read('pulls-state.json')).prs)));
   } else {
     emit(pages('pulls'));
@@ -118,6 +118,38 @@ if (/^repos\/[^/]+\/[^/]+$/.test(route) && jqExpr === '.default_branch') {
     pr.state = fields.state;
     fs.writeFileSync(`${dir}/pulls-state.json`, JSON.stringify(state));
   });
+  process.stdout.write('{}\n');
+} else if (/^repos\/[^/]+\/[^/]+\/git\/matching-refs\/tags\//.test(route)) {
+  if (failing.includes('claims')) die('HTTP 403: rate limit exceeded');
+  barrier('claims');
+  const prefix = 'refs/tags/' + route.split('/git/matching-refs/tags/')[1];
+  const refs = withLock(() => JSON.parse(read('claims-state.json')).refs);
+  emit(JSON.stringify(Object.entries(refs).filter(([ref]) => ref.startsWith(prefix)).map(([ref, sha]) => ({ ref, object: { sha, type: 'tag' } }))));
+} else if ((m = route.match(/^repos\/[^/]+\/[^/]+\/git\/tags\/([0-9a-f]{40})$/))) {
+  if (failing.includes('claim-read')) die('HTTP 403');
+  const tag = withLock(() => JSON.parse(read('claims-state.json')).tags[m[1]]);
+  if (!tag) die('HTTP 404');
+  emit(JSON.stringify(tag));
+} else if (/^repos\/[^/]+\/[^/]+\/git\/tags$/.test(route) && method === 'POST') {
+  if (failing.includes('claim-create')) die('HTTP 403');
+  const sha = withLock(() => {
+    const st = JSON.parse(read('claims-state.json'));
+    st.seq = (st.seq || 0) + 1;
+    const id = String(st.seq).padStart(40, 'c');
+    st.tags[id] = { sha: id, tag: fields.tag, message: fields.message, object: { sha: fields.object } };
+    fs.writeFileSync(`${dir}/claims-state.json`, JSON.stringify(st));
+    return id;
+  });
+  emit(JSON.stringify({ sha }));
+} else if (/^repos\/[^/]+\/[^/]+\/git\/refs$/.test(route) && method === 'POST') {
+  const created = withLock(() => {
+    const st = JSON.parse(read('claims-state.json'));
+    if (st.refs[fields.ref]) return false;
+    st.refs[fields.ref] = fields.sha;
+    fs.writeFileSync(`${dir}/claims-state.json`, JSON.stringify(st));
+    return true;
+  });
+  if (!created) die('HTTP 422: Reference already exists');
   process.stdout.write('{}\n');
 } else if (/^repos\/[^/]+\/[^/]+\/git\/refs\/heads\//.test(route) && method === 'DELETE') {
   fs.appendFileSync(`${dir}/deleted-refs.log`, route + '\n');
