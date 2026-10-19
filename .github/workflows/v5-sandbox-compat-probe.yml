@@ -1,0 +1,68 @@
+name: V5 strict sandbox runner compatibility probe
+
+# Diagnostic-only R3: nexagnet/.github#29.
+# No checkout, secrets, Claude token, Publisher token, product code or privileged relaxation.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/v5-sandbox-compat-probe.yml
+      - tests/v5-sandbox-compat-probe-contract.test.cjs
+
+permissions: {}
+
+jobs:
+  probe:
+    name: Isolated bwrap loopback on ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: Install bubblewrap without changing host policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends bubblewrap
+          command -v bwrap
+          bwrap --version
+      - name: Compare original vs isolated Linux network namespace
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "runner_image=${{ matrix.runner }}"
+          echo "kernel=$(uname -r)"
+          if test -r /proc/sys/kernel/apparmor_restrict_unprivileged_userns; then
+            echo "apparmor_restrict_unprivileged_userns=$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)"
+          else
+            echo "apparmor_restrict_unprivileged_userns=unknown"
+          fi
+          host_net="$(readlink /proc/self/ns/net)"
+          echo "original_network_namespace=$host_net"
+          echo "Testing true --unshare-user --unshare-net; no --share-net and no fallback."
+          set +e
+          HOST_NET="$host_net" timeout 15s bwrap \
+            --unshare-user --unshare-net \
+            --ro-bind / / --dev-bind /dev /dev --proc /proc --tmpfs /tmp \
+            -- /bin/bash -eu -c '
+              child_net="$(readlink /proc/self/ns/net)"
+              echo "isolated_network_namespace=$child_net"
+              test "$child_net" != "$HOST_NET"
+              grep -q "lo:" /proc/net/dev
+              ! grep -Eq "eth[0-9]+:" /proc/net/dev
+              echo "SANDBOX_NETWORK_NAMESPACE_PASS"
+            '
+          result=$?
+          set -e
+          if test "$result" -eq 0; then
+            echo "PROBE_RESULT=PASS" >> "$GITHUB_STEP_SUMMARY"
+            echo "PROBE_RESULT=PASS"
+          else
+            echo "PROBE_RESULT=FAIL exit_code=$result" >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::PROBE_RESULT=FAIL exit_code=$result; unsupported runner for strict sandbox"
+          fi
+          echo "Probe does not change host security settings or prove Claude Code itself is compatible."
