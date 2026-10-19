@@ -149,7 +149,8 @@ jobs:
           command -v bwrap
           bwrap --version
           command -v socat
-      - name: Claude proposes LOCAL worktree changes only
+      - id: claude
+        name: Claude proposes LOCAL worktree changes only
         uses: anthropics/claude-code-action@6fed3ca145920b639991cb756090506e1bcaf515 # v1
         with:
           github_token: ${{ github.token }}
@@ -185,7 +186,8 @@ jobs:
                     "~/.ssh",
                     "~/.aws",
                     "~/.claude",
-                    "/proc"
+                    "/proc/self/environ",
+                    "/proc/*/environ"
                   ],
                   "denyWrite": [
                     "${{ github.workspace }}/.github",
@@ -207,6 +209,8 @@ jobs:
               "permissions": {
                 "deny": [
                   "WebFetch","WebSearch",
+                  "Read(//proc/**)","Read(~/.claude/**)",
+                  "Read(~/.config/gh/**)","Read(~/.ssh/**)",
                   "Edit(.github/**)","Edit(infra/**)","Edit(deploy/**)",
                   "Edit(tools/autopilot/**)","Edit(.claude/**)",
                   "Edit(**/AGENTS.md)","Edit(**/CLAUDE.md)","Edit(.mcp.json)"
@@ -218,13 +222,20 @@ jobs:
             --allowedTools "Read,Glob,Grep,Edit,Write,Bash"
             --disallowedTools "WebFetch,WebSearch"
 
+      - name: Agent failure classification (no writes, no secret output)
+        if: failure()
+        shell: bash
+        run: |
+          echo "::error::BUILDER_AGENT_FAILED: no patch may be published; inspect Claude step for installation, strict sandbox, denied tool or turn-limit causes."
+          echo "BUILDER_AGENT_FAILED (unverified root cause)" >> "$GITHUB_STEP_SUMMARY"
       - name: Produce UNTRUSTED patch, never push from this job
         shell: bash
         run: |
           set -euo pipefail
           git add -A
           git diff --cached --quiet && {
-            echo "::error::No local changes"; exit 1;
+            echo "::error::NO_PATCH: Claude produced no local changes; inspect agent logs for tool denials, test failures or exhausted turns."
+            exit 1
           }
           git diff --cached --binary --no-ext-diff --no-renames > "$RUNNER_TEMP/proposed.patch"
           test -s "$RUNNER_TEMP/proposed.patch"
