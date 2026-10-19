@@ -324,3 +324,20 @@ test('structured status validator fails closed on missing, malformed, inconsiste
     rmSync(folder, { recursive: true, force: true });
   }
 });
+
+
+test('V5 runner compatibility probe preserves mandatory namespace isolation and does not weaken policy', () => {
+  const probe = readFileSync(resolve(__dirname, '../.github/workflows/v5-sandbox-compat-probe.yml'), 'utf8');
+  for (const expected of [
+    'ubuntu-22.04', 'ubuntu-24.04', 'permissions: {}',
+    '--unshare-user --unshare-net', '--ro-bind / /',
+    'child_net="$(readlink /proc/self/ns/net)"',
+    'test "$child_net" != "$HOST_NET"',
+    'grep -q "lo:" /proc/net/dev',
+    'PROBE_RESULT=FAIL', 'PROBE_RESULT=PASS',
+    'timeout 15s bwrap',
+  ]) assert.ok(probe.includes(expected), expected);
+  assert.doesNotMatch(probe, /sysctl\s+-w|--share-net|allowUnsandboxedCommands|secrets\.|ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|BUILDER_PUBLISHER_APP_PRIVATE_KEY/);
+  assert.doesNotMatch(probe, /actions\/checkout|git\s+clone|npm\s+install|pnpm\s+install|curl\s+.*\|.*bash/);
+  assert.ok(probe.includes('Probe does not change host security settings'));
+});
