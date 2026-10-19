@@ -45,6 +45,7 @@ jobs:
           echo "original_network_namespace=$host_net"
           echo "Testing true --unshare-user --unshare-net; no --share-net and no fallback."
           set +e
+          # shellcheck disable=SC2016  # Child shell expands variables after bwrap starts.
           HOST_NET="$host_net" timeout 15s bwrap \
             --unshare-user --unshare-net \
             --ro-bind / / --dev-bind /dev /dev --proc /proc --tmpfs /tmp \
