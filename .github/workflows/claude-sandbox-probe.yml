@@ -85,9 +85,17 @@ jobs:
           s.bind(('127.0.0.1', 0))
           s.listen(16)
           open(sys.argv[2], 'w').write(str(s.getsockname()[1]))
+          # 'ctl' = trusted control connection (first byte 'C'); anything else, including a bare
+          # connect/close or a curl request, is 'other' and counts as a sandbox connection.
+          # accept() is FIFO, so a control accepted later proves every earlier connection was logged.
           while True:
               c, _ = s.accept()
-              log.write('accept\n')
+              c.settimeout(0.3)
+              try:
+                  data = c.recv(16)
+              except Exception:
+                  data = b''
+              log.write('ctl\n' if data.startswith(b'C') else 'other\n')
               c.close()
           LISTENER_EOF
 
@@ -155,13 +163,15 @@ jobs:
           done
           port="$(cat "$probe/public/endpoint-port")"
           [[ "$port" =~ ^[1-9][0-9]*$ ]]
-          # Positive control OUTSIDE the sandbox: proves the listener really accepts.
-          timeout 3 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port"
-          sleep 0.3
-          control="$(grep -c '^accept$' "$probe/private/listener.log" || true)"
-          test "$control" -ge 1
-          echo "$control" > "$probe/private/control_count"
-          echo "PROBE_SETUP_OK control_connections=$control"
+          # Pre-probe positive control OUTSIDE the sandbox: proves the listener accepts and logs.
+          # A second control runs after Claude (next step); a dead listener can never yield PROVEN.
+          timeout 3 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port; printf 'C\n' >&3"
+          for _ in $(seq 1 50); do
+            if [ "$(grep -c '^ctl$' "$probe/private/listener.log" || true)" -ge 1 ]; then break; fi
+            sleep 0.1
+          done
+          test "$(grep -c '^ctl$' "$probe/private/listener.log" || true)" -ge 1
+          echo "PROBE_SETUP_OK pre_probe_control=1"
 
       - name: Install bubblewrap for isolated Claude subprocesses
         shell: bash
@@ -262,6 +272,29 @@ jobs:
             --allowedTools "Bash(bash ${{ runner.temp }}/probe/public/probe.sh)"
             --disallowedTools "WebFetch,WebSearch,Write,Edit,NotebookEdit,Read,Glob,Grep"
 
+      # Post-probe positive control, from the trusted side, BEFORE the listener is stopped. If the
+      # listener died at any point after setup, "connection denied" would be indistinguishable from
+      # "nobody listening"; this step records whether it still accepts and logs a control.
+      - name: Post-probe listener liveness control (listener must still be alive and logging)
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          priv="$RUNNER_TEMP/probe/private"
+          port="$(cat "$RUNNER_TEMP/probe/public/endpoint-port" 2>/dev/null || echo 0)"
+          before="$(grep -c '^ctl$' "$priv/listener.log" 2>/dev/null || true)"
+          [[ "${before:-}" =~ ^[0-9]+$ ]] || before=0
+          result=dead
+          if [[ "$port" =~ ^[1-9][0-9]*$ ]] && timeout 3 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port; printf 'C\n' >&3" 2> /dev/null; then
+            for _ in $(seq 1 50); do
+              now="$(grep -c '^ctl$' "$priv/listener.log" 2>/dev/null || true)"
+              if [ "${now:-0}" -ge $((before + 1)) ]; then result=ok; break; fi
+              sleep 0.1
+            done
+          fi
+          echo "$result" > "$priv/post_control"
+          echo "PROBE_POST_CONTROL=$result"
+
       # Decision comes ONLY from hook audit + host listener + preconditions. Always runs.
       - name: Decide from trusted evidence only (no model statement is evidence)
         if: always()
@@ -271,16 +304,16 @@ jobs:
           probe="$RUNNER_TEMP/probe"
           priv="$probe/private"
           audit="$priv/audit.jsonl"
-          kill "$(cat "$priv/listener.pid" 2>/dev/null)" 2>/dev/null || true
           fail=()
           unproven=()
           pre=0
           post=0
           expected="$(cat "$priv/expected_cmd_sha" 2>/dev/null || true)"
-          control="$(cat "$priv/control_count" 2>/dev/null || echo 0)"
-          accepts="$(grep -c '^accept$' "$priv/listener.log" 2>/dev/null || true)"
-          [[ "${accepts:-}" =~ ^[0-9]+$ ]] || accepts=0
-          [[ "$control" =~ ^[0-9]+$ ]] || control=0
+          control="$(grep -c '^ctl$' "$priv/listener.log" 2>/dev/null || true)"
+          others="$(grep -c '^other$' "$priv/listener.log" 2>/dev/null || true)"
+          post_control="$(cat "$priv/post_control" 2>/dev/null || echo missing)"
+          [[ "${control:-}" =~ ^[0-9]+$ ]] || control=0
+          [[ "${others:-}" =~ ^[0-9]+$ ]] || others=0
           if [ ! -s "$audit" ] || ! jq -s . "$audit" > /dev/null 2>&1; then
             unproven+=("NO_AUDIT_RECORDS")
           else
@@ -328,10 +361,16 @@ jobs:
             [ "$(flag leak_canary_value)" = false ] || fail+=("CANARY_VALUE_IN_TOOL_OUTPUT")
             [ "$(flag leak_fixture_content)" = false ] || fail+=("FIXTURE_CONTENT_IN_TOOL_OUTPUT")
           fi
+          # Any non-control connection the host listener accepted came from the sandbox: a leak.
+          if [ "$others" -gt 0 ]; then
+            fail+=("HOST_LISTENER_ACCEPTED_SANDBOX_CONNECTION count=$others")
+          fi
+          # "Denied" only means something if the listener was demonstrably alive before AND after
+          # the probe (two trusted controls logged in order, so everything between was logged too).
           if [ "$control" -lt 1 ]; then
             unproven+=("LISTENER_CONTROL_MISSING")
-          elif [ "$accepts" -gt "$control" ]; then
-            fail+=("HOST_LISTENER_ACCEPTED_SANDBOX_CONNECTION extra=$((accepts - control))")
+          elif [ "$post_control" != ok ] || [ "$control" -lt 2 ]; then
+            unproven+=("LISTENER_NOT_VERIFIED_ALIVE_AFTER_PROBE post_control=$post_control controls=$control")
           fi
           if [ "${#fail[@]}" -gt 0 ]; then
             verdict=SANDBOX_NEGATIVE_FAIL
@@ -343,11 +382,13 @@ jobs:
           {
             echo "### Sandbox negative probe: $verdict"
             echo "- run: $GITHUB_RUN_ID attempt $GITHUB_RUN_ATTEMPT, sha $GITHUB_SHA"
-            echo "- bash tool calls (pre/post): $pre/$post; listener accepts $accepts (control $control)"
+            echo "- bash tool calls (pre/post): $pre/$post; listener controls $control, sandbox connections $others, post-probe control $post_control"
             echo "- failures: ${fail[*]:-none}"
             echo "- unproven: ${unproven[*]:-none}"
           } | tee -a "$GITHUB_STEP_SUMMARY"
           echo "SANDBOX_PROBE_VERDICT=$verdict"
+          # Stop the listener only now, after every comparison above.
+          kill "$(cat "$priv/listener.pid" 2>/dev/null)" 2>/dev/null || true
           test "$verdict" = SANDBOX_NEGATIVE_PROVEN || { echo "::error::$verdict"; exit 1; }
 
       - name: Upload sanitized audit (hashes, markers, booleans only)

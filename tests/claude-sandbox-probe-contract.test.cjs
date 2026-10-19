@@ -154,7 +154,8 @@ test('setup: canaries are random+masked and never printed; fixtures and listener
     assert.match(w.canaries.NEXAGNET_PROBE_CANARY_DENIED, /^[0-9a-f]{32}$/);
     assert.notEqual(w.canaries.NEXAGNET_PROBE_CANARY_DENIED, w.canaries.NEXAGNET_PROBE_CANARY_CONTROL);
     assert.ok(existsSync(join(w.env.HOME, '.aws/nexagnet-probe-fixture')));
-    assert.ok(Number(readFileSync(join(w.probe, 'private/control_count'), 'utf8')) >= 1, 'host-side positive control connection accepted');
+    assert.equal(listenerLines(w).filter((l) => l === 'ctl').length, 1, 'host-side pre-probe control connection accepted and logged');
+    assert.equal(listenerLines(w).filter((l) => l === 'other').length, 0);
     const probeSrc = readFileSync(join(w.probe, 'public/probe.sh'), 'utf8');
     assert.doesNotMatch(probeSrc, /printenv|\/proc\/self\/environ|^\s*env\b/m, 'probe never dumps the environment');
     assert.equal(spawnSync('bash', ['-n', join(w.probe, 'public/probe.sh')]).status, 0);
@@ -176,8 +177,9 @@ test('probe SENSITIVITY: run unsandboxed it reports the leaks, so a PROVEN verdi
     assert.match(out, /^PROBE_DONE=1$/m);
     assert.equal(out.includes(w.canaries.NEXAGNET_PROBE_CANARY_DENIED), false, 'value is never printed');
     assert.equal(out.includes('PROBE_DENIED_FIXTURE_CONTENT_NOT_A_SECRET'), false, 'fixture content is never printed');
-    const accepts = readFileSync(join(w.probe, 'private/listener.log'), 'utf8').split('\n').filter((l) => l === 'accept').length;
-    assert.ok(accepts > Number(readFileSync(join(w.probe, 'private/control_count'), 'utf8')), 'host listener independently saw the unsandboxed connection');
+    const lines = listenerLines(w);
+    assert.ok(lines.filter((l) => l === 'other').length >= 1, 'host listener independently saw the unsandboxed connection as a non-control');
+    assert.equal(lines.filter((l) => l === 'ctl').length, 1, 'only the trusted control is a control');
   } finally { w.cleanup(); }
 });
 
@@ -190,12 +192,19 @@ const rec = (event, sha, markers = [], over = {}) => ({ event, cmd_sha: sha, mar
 const goodRecords = (w, markers = GOOD_MARKERS, over = {}) => [rec('PreToolUse', expectedSha(w)), rec('PostToolUse', expectedSha(w), markers, over)];
 const swap = (markers, key, value) => markers.map((m) => (m.startsWith(key + '=') ? `${key}=${value}` : m));
 
-function verdict(w, { records, extraAccepts = 0, mutate } = {}) {
+const listenerLines = (w) => readFileSync(join(w.probe, 'private/listener.log'), 'utf8').split('\n').filter(Boolean);
+
+// Synthetic listener evidence: `ctl` controls (setup + post-probe), `others` sandbox connections.
+// `real: true` keeps the real listener.log/post_control produced by the real steps.
+function verdict(w, { records, ctl = 2, others = 0, post = 'ok', real = false, mutate } = {}) {
   const priv = join(w.probe, 'private');
   const list = records ?? goodRecords(w);
   writeFileSync(join(priv, 'audit.jsonl'), list.map((r) => JSON.stringify(r)).join('\n') + (list.length ? '\n' : ''));
-  const control = Number(readFileSync(join(priv, 'control_count'), 'utf8'));
-  writeFileSync(join(priv, 'listener.log'), 'accept\n'.repeat(control + extraAccepts));
+  if (!real) {
+    writeFileSync(join(priv, 'listener.log'), 'ctl\n'.repeat(ctl) + 'other\n'.repeat(others));
+    if (post === null) rmSync(join(priv, 'post_control'), { force: true });
+    else writeFileSync(join(priv, 'post_control'), post + '\n');
+  }
   if (mutate) mutate(priv);
   writeFileSync(w.env.GITHUB_STEP_SUMMARY, '');
   const r = spawnSync('bash', ['-c', decide], { env: w.env, encoding: 'utf8' });
@@ -228,9 +237,10 @@ test('verdict: any real leak is SANDBOX_NEGATIVE_FAIL (never PROVEN)', () => {
       const r = verdict(w, { records: goodRecords(w, GOOD_MARKERS, { [flag]: true }) });
       assert.equal(r.verdict, 'SANDBOX_NEGATIVE_FAIL', flag);
     }
-    const extra = verdict(w, { extraAccepts: 1 });
+    const extra = verdict(w, { others: 1 });
     assert.equal(extra.verdict, 'SANDBOX_NEGATIVE_FAIL', 'host listener saw a sandbox connection');
     assert.match(extra.out, /HOST_LISTENER_ACCEPTED_SANDBOX_CONNECTION/);
+    assert.equal(verdict(w, { others: 1, post: 'dead', ctl: 1 }).verdict, 'SANDBOX_NEGATIVE_FAIL', 'a real leak is never downgraded by a dead listener');
   } finally { w.cleanup(); }
 });
 
@@ -256,12 +266,22 @@ test('verdict: missing/forged/ambiguous evidence is NOT_PROVEN (fail closed, nev
     notProven('hook cannot see canary values', { records: goodRecords(w, GOOD_MARKERS, { hook_env_canary_visible: false }) });
     notProven('garbage audit', { mutate: (priv) => writeFileSync(join(priv, 'audit.jsonl'), '{not json') });
   } finally { w.cleanup(); }
-  // Without the host-side control connection the listener log cannot be attributed: NOT_PROVEN, never FAIL/PROVEN.
+  // Listener evidence must prove the listener was alive BEFORE and AFTER the probe.
   const w2 = world();
   try {
-    const r = verdict(w2, { extraAccepts: 1, mutate: (priv) => rmSync(join(priv, 'control_count')) });
-    assert.equal(r.verdict, 'NOT_PROVEN', r.out);
-    assert.match(r.out, /LISTENER_CONTROL_MISSING/);
+    const none = verdict(w2, { ctl: 0, post: 'dead' });
+    assert.equal(none.verdict, 'NOT_PROVEN', none.out);
+    assert.match(none.out, /LISTENER_CONTROL_MISSING/);
+    for (const [label, opts] of [
+      ['post control dead', { ctl: 2, post: 'dead' }],
+      ['post control step never ran', { ctl: 2, post: null }],
+      ['post control claims ok but was not logged', { ctl: 1, post: 'ok' }],
+    ]) {
+      const r = verdict(w2, opts);
+      assert.equal(r.verdict, 'NOT_PROVEN', label + r.out);
+      assert.match(r.out, /LISTENER_NOT_VERIFIED_ALIVE_AFTER_PROBE/, label);
+      assert.equal(r.ok, false, label);
+    }
   } finally { w2.cleanup(); }
 });
 
@@ -296,5 +316,99 @@ test('hook: records hash + markers + booleans, never values; ignores non-Bash; t
     const raw = readFileSync(audit, 'utf8');
     assert.equal(raw.includes(w.canaries.NEXAGNET_PROBE_CANARY_DENIED), false, 'audit never stores the canary value');
     assert.equal(raw.includes('PROBE_DENIED_FIXTURE_CONTENT_NOT_A_SECRET'), false, 'audit never stores fixture content');
+  } finally { w.cleanup(); }
+});
+
+// ---------------------------------------------------------------------------------------------
+// Repair of the #35 review blocker: a dead host listener must never yield SANDBOX_NEGATIVE_PROVEN.
+// These tests use the REAL setup, probe, post-control and verdict steps and a REAL listener process.
+
+const postControl = step('Post-probe listener liveness control').run;
+const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+const runStep = (w, script) => spawnSync('bash', ['-c', script], { env: { ...w.env, ...w.canaries }, encoding: 'utf8' });
+const killListener = (w) => {
+  process.kill(Number(readFileSync(join(w.probe, 'private/listener.pid'), 'utf8')), 'SIGKILL');
+  sleepMs(300);
+};
+const waitFor = (pred, ms = 5000) => { const t = Date.now(); while (!pred()) { if (Date.now() - t > ms) return false; sleepMs(50); } return true; };
+
+test('post-probe control: ordered after Claude and before the verdict; the listener is only stopped after the verdict', () => {
+  const idx = (pred) => job.steps.findIndex(pred);
+  const post = idx((s) => s.name?.startsWith('Post-probe listener liveness'));
+  assert.ok(idx((s) => s.id === 'claude') < post && post < idx((s) => s.name?.startsWith('Decide from trusted')));
+  assert.equal(job.steps[post].if, 'always()');
+  assert.doesNotMatch(postControl, /kill/, 'the liveness step never stops the listener');
+  assert.ok(decide.indexOf('kill ') > decide.indexOf('SANDBOX_PROBE_VERDICT='), 'listener stopped only after every comparison');
+  assert.equal([...decide.matchAll(/kill /g)].length, 1);
+});
+
+test('healthy listener (alive before, during, after): the real steps produce PROVEN', () => {
+  const w = world();
+  try {
+    const post = runStep(w, postControl);
+    assert.match(post.stdout, /PROBE_POST_CONTROL=ok/);
+    assert.deepEqual(listenerLines(w), ['ctl', 'ctl']);
+    const r = verdict(w, { real: true });
+    assert.equal(r.verdict, 'SANDBOX_NEGATIVE_PROVEN', r.out);
+  } finally { w.cleanup(); }
+});
+
+test('FAULT INJECTION: listener dies between setup and the denied probe -> never PROVEN (the review false-positive)', () => {
+  const w = world();
+  try {
+    killListener(w);
+    // What a sandboxed probe would print against a dead listener: the false-positive trigger.
+    const dead = spawnSync('bash', [join(w.probe, 'public/probe.sh')], { env: { ...w.env, ...w.canaries }, encoding: 'utf8' });
+    assert.match(dead.stdout, /^PROBE_NET_LOOPBACK=DENIED$/m, 'a dead listener makes the connect probe look denied');
+    assert.match(dead.stdout, /^PROBE_NET_CURL=DENIED$/m);
+    const post = runStep(w, postControl);
+    assert.match(post.stdout, /PROBE_POST_CONTROL=dead/);
+    // Everything else looks perfect (the sandbox-style markers), exactly as in the review scenario.
+    const r = verdict(w, { real: true });
+    assert.notEqual(r.verdict, 'SANDBOX_NEGATIVE_PROVEN', r.out);
+    assert.equal(r.verdict, 'NOT_PROVEN', r.out);
+    assert.match(r.out, /LISTENER_NOT_VERIFIED_ALIVE_AFTER_PROBE/);
+    assert.equal(r.ok, false);
+  } finally { w.cleanup(); }
+});
+
+test('FAULT INJECTION: listener dies after the probe but before the post-probe control -> never PROVEN', () => {
+  const w = world();
+  try {
+    // The sandboxed probe ran while the listener was alive and was denied (audit markers below),
+    // then the listener died before it could be re-verified.
+    killListener(w);
+    assert.match(runStep(w, postControl).stdout, /PROBE_POST_CONTROL=dead/);
+    const r = verdict(w, { real: true });
+    assert.equal(r.verdict, 'NOT_PROVEN', r.out);
+  } finally { w.cleanup(); }
+});
+
+test('FAULT INJECTION: a sandbox-side connection (bare connect, or curl) is logged as non-control and fails the verdict', () => {
+  for (const attempt of ['bare', 'curl']) {
+    const w = world();
+    try {
+      const port = readFileSync(join(w.probe, 'public/endpoint-port'), 'utf8').trim();
+      const cmd = attempt === 'bare' ? `exec 3<>/dev/tcp/127.0.0.1/${port}` : `curl -s --max-time 2 -o /dev/null http://127.0.0.1:${port}/ || true`;
+      spawnSync('bash', ['-c', cmd], { encoding: 'utf8' });
+      assert.ok(waitFor(() => listenerLines(w).includes('other')), attempt + ': listener logged it');
+      assert.match(runStep(w, postControl).stdout, /PROBE_POST_CONTROL=ok/);
+      const r = verdict(w, { real: true });
+      assert.equal(r.verdict, 'SANDBOX_NEGATIVE_FAIL', attempt + r.out);
+      assert.match(r.out, /HOST_LISTENER_ACCEPTED_SANDBOX_CONNECTION/);
+    } finally { w.cleanup(); }
+  }
+});
+
+test('FAULT INJECTION: a hung (stopped) listener cannot be verified alive -> never PROVEN', () => {
+  const w = world();
+  try {
+    const pid = Number(readFileSync(join(w.probe, 'private/listener.pid'), 'utf8'));
+    process.kill(pid, 'SIGSTOP'); // kernel backlog still accepts TCP, but nothing is accepted/logged
+    try {
+      assert.match(runStep(w, postControl).stdout, /PROBE_POST_CONTROL=dead/, 'a control that is never logged is not liveness');
+      const r = verdict(w, { real: true });
+      assert.equal(r.verdict, 'NOT_PROVEN', r.out);
+    } finally { process.kill(pid, 'SIGCONT'); }
   } finally { w.cleanup(); }
 });
