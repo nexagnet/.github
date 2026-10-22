@@ -79,7 +79,9 @@ Verdicts (`Decide from trusted evidence only`, always runs, exit 0 only for PROV
 - `SANDBOX_NEGATIVE_FAIL`: any denial is violated.
 - `NOT_PROVEN`: anything missing, ambiguous, forged or unobservable (no hook records, other commands run,
   controls absent, hook cannot see canaries, listener control missing, listener not provably alive after the
-  probe). The control canary check matters: if the
+  probe). The verifier requires exactly one of each expected marker; missing, duplicate, conflicting or
+  unknown markers cannot produce PROVEN. Every credential observation must explicitly report ABSENT;
+  missing or unknown outcomes are NOT_PROVEN. The control canary check matters: if the
   control canary is also absent the deny setting cannot be told apart from env scrubbing, so the result is
   NOT_PROVEN, not PROVEN.
 

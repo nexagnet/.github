@@ -212,6 +212,24 @@ test('verdict: PROVEN only when every control and every denial holds; exit code 
   } finally { w.cleanup(); }
 });
 
+test('verdict: every expected marker is required exactly once, with no ambiguous or unknown evidence', () => {
+  const cases = [
+    ...GOOD_MARKERS.map((marker) => ({ label: `missing ${marker}`, markers: GOOD_MARKERS.filter((m) => m !== marker) })),
+    ...GOOD_MARKERS.map((marker) => ({ label: `duplicate ${marker}`, markers: [...GOOD_MARKERS, marker] })),
+    { label: 'conflicting network results', markers: [...GOOD_MARKERS, 'PROBE_NET_LOOPBACK=REACHED'] },
+    { label: 'unknown marker', markers: [...GOOD_MARKERS, 'PROBE_UNEXPECTED=TRUE'] },
+    { label: 'unknown credential outcome', markers: swap(GOOD_MARKERS, 'PROBE_ENV_GITHUB_TOKEN', 'UNKNOWN') },
+  ];
+  for (const { label, markers } of cases) {
+    const w = world();
+    try {
+      const r = verdict(w, { records: goodRecords(w, markers) });
+      assert.equal(r.verdict, 'NOT_PROVEN', label + '\n' + r.out);
+      assert.equal(r.ok, false, label);
+    } finally { w.cleanup(); }
+  }
+});
+
 test('verdict: any real leak is SANDBOX_NEGATIVE_FAIL (never PROVEN)', () => {
   const w = world();
   try {

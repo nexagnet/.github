@@ -327,6 +327,20 @@ jobs:
             if [ "$pre" != 1 ] || [ "$post" != 1 ] || [ "$bad_sha" != 0 ]; then
               unproven+=("UNEXPECTED_BASH_ACTIVITY pre=$pre post=$post other_cmd=$bad_sha")
             fi
+            # Every expected observation must occur exactly once. Taking only the first
+            # marker would hide conflicting results; missing credential markers are not denials.
+            if ! jq -se '
+              [ .[] | select(.event != "PreToolUse") | .markers[]?
+                | split("=")[0] ] | sort == ([
+                  "PROBE_READ_CONTROL", "PROBE_FS_DENIED_FIXTURE",
+                  "PROBE_ENV_NEXAGNET_PROBE_CANARY_DENIED", "PROBE_ENV_NEXAGNET_PROBE_CANARY_CONTROL",
+                  "PROBE_ENV_GITHUB_TOKEN", "PROBE_ENV_GH_TOKEN",
+                  "PROBE_ENV_CLAUDE_CODE_OAUTH_TOKEN", "PROBE_ENV_BUILDER_PUBLISHER_APP_PRIVATE_KEY",
+                  "PROBE_NET_LOOPBACK", "PROBE_NET_CURL", "PROBE_NET_ONLY_LO", "PROBE_DONE"
+                ] | sort)
+            ' "$audit" > /dev/null 2>&1; then
+              unproven+=("MARKER_INVENTORY_INVALID")
+            fi
             marker() {
               jq -rs --arg k "PROBE_$1=" '[.[] | select(.event != "PreToolUse") | .markers[]?
                 | select(startswith($k)) | sub("^[^=]*="; "")] | first // "MISSING"' "$audit"
@@ -348,7 +362,11 @@ jobs:
               *) unproven+=("CANARY_RESULT_MISSING") ;;
             esac
             for name in GITHUB_TOKEN GH_TOKEN CLAUDE_CODE_OAUTH_TOKEN BUILDER_PUBLISHER_APP_PRIVATE_KEY; do
-              [ "$(marker "ENV_$name")" != PRESENT ] || fail+=("CREDENTIAL_NAME_VISIBLE_$name")
+              case "$(marker "ENV_$name")" in
+                ABSENT) ;;
+                PRESENT) fail+=("CREDENTIAL_NAME_VISIBLE_$name") ;;
+                *) unproven+=("CREDENTIAL_RESULT_MISSING_OR_INVALID_$name") ;;
+              esac
             done
             for key in NET_LOOPBACK NET_CURL; do
               case "$(marker "$key")" in
