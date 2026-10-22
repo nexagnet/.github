@@ -299,6 +299,7 @@ test('UI finding paths accept normal filenames and reject GitHub output control 
 test('parity material is frozen and baseline spec is read without external URLs or execution', () => {
   const step = jobs.review.steps.find(s => s.name === 'Prepare bounded Figma parity context');
   assert.ok(step);
+  assert.equal(step.if, "needs.gate.outputs.ui_required == 'true'");
   assert.equal(step.env.BASE, '${{ needs.gate.outputs.base_sha }}');
   assert.equal(step.env.PR_BODY_B64, '${{ needs.gate.outputs.pr_body_b64 }}');
   assert.match(step.run, /git show "\$BASE:\$SPEC_PATH"/);

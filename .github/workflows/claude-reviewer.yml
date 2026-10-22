@@ -222,6 +222,7 @@ jobs:
           test -s "$RUNNER_TEMP/reviewer-pr-diff.patch"
           test "$(wc -c < "$RUNNER_TEMP/reviewer-pr-diff.patch")" -le 500000
       - name: Prepare bounded Figma parity context
+        if: needs.gate.outputs.ui_required == 'true'
         shell: bash
         env:
           BASE: ${{ needs.gate.outputs.base_sha }}
