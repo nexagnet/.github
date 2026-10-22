@@ -1,0 +1,360 @@
+name: Nexagnet Synthetic MCP Startup Isolation Probe
+
+# Diagnostic branch execution only; production Builder and PR43 remain untouched.
+on:
+  workflow_call:
+    inputs:
+      expected_consumer_sha:
+        type: string
+        required: true
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+
+permissions: {}
+concurrency:
+  group: nexagnet-mcp-isolation-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  mcp-startup:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    env:
+      CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '1'
+      ENABLE_CLAUDEAI_MCP_SERVERS: 'false'
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1'
+    steps:
+      - name: Gate reviewed owner diagnostic branch and exact consumer SHA
+        shell: bash
+        env:
+          EXPECTED_CONSUMER_SHA: ${{ inputs.expected_consumer_sha }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = 'nexagnet/legal-office'
+          test "$GITHUB_ACTOR" = 'phungtienviet14-sketch'
+          test "$GITHUB_EVENT_NAME" = 'workflow_dispatch'
+          test "$GITHUB_REF" = 'refs/heads/codex/tool-isolation-runtime-36-37'
+          [[ "$EXPECTED_CONSUMER_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$GITHUB_SHA" = "$EXPECTED_CONSUMER_SHA"
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Prepare trusted synthetic fixture and evidence interpreter
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/mcp-isolation/public" "$RUNNER_TEMP/mcp-isolation/private"
+          chmod 700 "$RUNNER_TEMP/mcp-isolation/private"
+          cat > "$RUNNER_TEMP/mcp-isolation/public/verifier.py" <<'PY'
+          # BEGIN MCP PROBE PYTHON
+          import collections, json, os, pathlib, re, shutil, signal, subprocess, sys, time
+
+          IDS = ("project", "local", "user", "plugin")
+          ROOT = pathlib.Path(os.environ.get("RUNNER_TEMP", ".")) / "mcp-isolation"
+          SERVER = r'''const fs = require("node:fs");
+          const readline = require("node:readline");
+          const [id, phase, log] = process.argv.slice(2);
+          function record(event) { fs.appendFileSync(log, JSON.stringify({id, phase, event, pid:process.pid}) + "\n"); }
+          function reply(request, result) { process.stdout.write(JSON.stringify({jsonrpc:"2.0", id:request.id, result}) + "\n"); }
+          record("startup");
+          readline.createInterface({input:process.stdin}).on("line", line => {
+            const request = JSON.parse(line);
+            if (request.method === "initialize") {
+              record("initialize");
+              reply(request, {protocolVersion:request.params.protocolVersion, capabilities:{tools:{}}, serverInfo:{name:"synthetic-canary",version:"1.0.0"}});
+            } else if (request.method === "tools/list") {
+              record("tools_list");
+              reply(request, {tools:[{name:"ping",description:"Synthetic boolean fixture",inputSchema:{type:"object",properties:{},additionalProperties:false}}]});
+            } else if (request.method === "tools/call") {
+              record("tool_call"); reply(request, {content:[{type:"text",text:"SYNTHETIC_CONTROL_TRUE"}]});
+            } else if (request.id !== undefined) { reply(request, {}); }
+          });
+          process.stdin.on("end", () => process.exit(0));
+          '''
+
+          def write_json(path, value):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(json.dumps(value), encoding="utf-8")
+
+          def setup(phase):
+              assert phase in ("control", "candidate")
+              public, private = ROOT / "public", ROOT / "private"
+              public.mkdir(parents=True, exist_ok=True)
+              private.mkdir(parents=True, exist_ok=True)
+              server = public / "server.cjs"
+              server.write_text(SERVER, encoding="utf-8")
+              (public / "control.txt").write_text("MCP_LOCAL_READ_CONTROL\n", encoding="utf-8")
+              home, workspace = public / ("home-" + phase), pathlib.Path(os.environ["GITHUB_WORKSPACE"])
+              home.mkdir(parents=True, exist_ok=True)
+              log = private / (phase + ".jsonl")
+              log.write_text("", encoding="utf-8")
+              def entry(identity):
+                  return {"command":shutil.which("node"), "args":[str(server), identity, phase, str(log)]}
+              project = workspace / ".mcp.json"
+              if phase == "control" and project.exists():
+                  raise RuntimeError("Unexpected pre-existing project MCP config")
+              write_json(project, {"mcpServers":{"project_canary":entry("project")}})
+              write_json(home / ".claude.json", {"mcpServers":{"user_canary":entry("user")}, "projects":{
+                  str(workspace):{"hasTrustDialogAccepted":True, "enableAllProjectMcpServers":True,
+                                  "mcpServers":{"local_canary":entry("local")}}}})
+              plugin = public / ("plugin-" + phase)
+              write_json(plugin / ".claude-plugin/plugin.json", {"name":"nexagnetprobe", "version":"1.0.0"})
+              write_json(plugin / ".mcp.json", {"mcpServers":{"plugin_canary":entry("plugin")}})
+
+          def content_text(value):
+              if isinstance(value, str):
+                  return value
+              if isinstance(value, list):
+                  return "".join(content_text(item) for item in value)
+              if isinstance(value, dict):
+                  return content_text(value.get("text", ""))
+              return ""
+
+          def summarize_messages(messages, action_success, cli_version="UNVERIFIED"):
+              report = {"action_success":action_success, "cli_version":cli_version, "init_count":0, "total_servers":0,
+                        "connected_servers":0, "read_ok":False, "unexpected_tool":False}
+              uses, results, invalid_init = [], [], False
+              for message in messages:
+                  if message.get("type") == "system" and message.get("subtype") == "init":
+                      report["init_count"] += 1
+                      servers = message.get("mcp_servers")
+                      if not isinstance(servers, list) or any(not isinstance(server, dict) or not isinstance(server.get("status"), str) for server in servers):
+                          invalid_init = True
+                          continue
+                      report["total_servers"] += len(servers)
+                      report["connected_servers"] += sum(server.get("status") == "connected" for server in servers)
+                  body = message.get("message", {}).get("content", [])
+                  if not isinstance(body, list):
+                      continue
+                  if message.get("type") == "assistant":
+                      uses.extend(item for item in body if item.get("type") == "tool_use")
+                  if message.get("type") == "user":
+                      results.extend(item for item in body if item.get("type") == "tool_result")
+              expected = str(ROOT / "public/control.txt")
+              report["unexpected_tool"] = invalid_init or any(use.get("name") != "Read" or use.get("input", {}).get("file_path") != expected for use in uses)
+              matching = [result for result in results if len(uses) == 1 and result.get("tool_use_id") == uses[0].get("id")]
+              report["read_ok"] = len(uses) == 1 and len(matching) == 1 and not matching[0].get("is_error", False) and "MCP_LOCAL_READ_CONTROL" in content_text(matching[0].get("content"))
+              completed = [message for message in messages if message.get("type") == "result"]
+              report["action_success"] = action_success and len(completed) == 1 and completed[0].get("subtype") == "success" and not completed[0].get("is_error", True)
+              return report
+
+          def load_events(phase):
+              path = ROOT / "private" / (phase + ".jsonl")
+              if not path.exists() or path.stat().st_size > 65536:
+                  return None
+              try:
+                  return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+              except (ValueError, OSError):
+                  return None
+
+          def report_valid(report):
+              booleans = ("action_success", "read_ok", "unexpected_tool")
+              counts = ("init_count", "total_servers", "connected_servers")
+              return isinstance(report, dict) and set(report) == set(booleans + counts + ("cli_version",)) and isinstance(report["cli_version"], str) and all(type(report[key]) is bool for key in booleans) and all(type(report[key]) is int and report[key] >= 0 for key in counts)
+
+          def guard():
+              raw = sys.stdin.read(65537)
+              try:
+                  value = json.loads(raw) if len(raw) <= 65536 else {}
+                  expected = str(ROOT / "public/control.txt")
+                  valid = value.get("hook_event_name") == "PreToolUse" and value.get("tool_name") == "Read" and value.get("tool_input", {}).get("file_path") == expected
+              except (ValueError, TypeError, AttributeError):
+                  valid = False
+              decision = {} if valid else {"hookSpecificOutput":{"hookEventName":"PreToolUse", "permissionDecision":"deny", "permissionDecisionReason":"Outside the synthetic Read control"}}
+              print(json.dumps(decision))
+
+          def controls_valid(events):
+              if not isinstance(events, list):
+                  return False
+              for event in events:
+                  if set(event) != {"id", "phase", "event", "pid"} or event["id"] not in IDS or event["phase"] != "control" or event["event"] not in ("startup", "initialize", "tools_list") or type(event["pid"]) is not int:
+                      return False
+              counts = collections.Counter((event["id"], event["event"]) for event in events)
+              return all(counts[(identity, "startup")] == 1 and counts[(identity, "initialize")] == 1 and counts[(identity, "tools_list")] >= 1 for identity in IDS)
+
+          def assess(value):
+              reasons, failures = [], []
+              control, candidate = value.get("control", {}), value.get("candidate", {})
+              if not controls_valid(value.get("control_events")):
+                  reasons.append("SOURCE_DISCOVERY_CONTROL_MISSING_OR_AMBIGUOUS")
+              if value.get("control_stopped") is not True:
+                  reasons.append("CONTROL_PROCESSES_NOT_STOPPED")
+              for label, report in (("CONTROL", control), ("CANDIDATE", candidate)):
+                  if report.get("cli_version") != "2.1.293":
+                      reasons.append(label + "_CLI_VERSION_UNVERIFIED")
+                  if not report_valid(report) or report.get("action_success") is not True or report.get("read_ok") is not True or report.get("init_count") != 1 or report.get("unexpected_tool") is not False:
+                      reasons.append(label + "_INITIALIZATION_OR_READ_CONTROL_INVALID")
+              if control.get("connected_servers") != 4 or control.get("total_servers") != 4:
+                  reasons.append("CONTROL_SERVER_DISCOVERY_INCOMPLETE")
+              candidate_events = value.get("candidate_events")
+              if not isinstance(candidate_events, list):
+                  reasons.append("CANDIDATE_MARKER_AUDIT_MISSING")
+              elif candidate_events:
+                  failures.append("UNAUTHORIZED_MCP_PROCESS_EVENT")
+              if candidate.get("total_servers", 0) != 0:
+                  failures.append("UNAUTHORIZED_MCP_SERVER_DISCOVERED")
+              verdict = "MCP_STARTUP_NEGATIVE_FAIL" if failures else ("NOT_PROVEN" if reasons else "MCP_STARTUP_NEGATIVE_PROVEN")
+              return {"schema":"nexagnet-mcp-startup-v1", "verdict":verdict, "failures":failures, "unproven":reasons,
+                      "control_source_count":4 if controls_valid(value.get("control_events")) else 0,
+                      "candidate_event_count":len(candidate_events) if isinstance(candidate_events, list) else None,
+                      "control":control, "candidate":candidate, "control_stopped":value.get("control_stopped") is True}
+
+          def stop_controls(events):
+              stopped = True
+              for pid in {event["pid"] for event in events if event.get("event") == "startup"}:
+                  proc = pathlib.Path("/proc") / str(pid)
+                  if not proc.exists():
+                      continue
+                  command = (proc / "cmdline").read_bytes().split(b"\0")
+                  if str(ROOT / "public/server.cjs").encode() not in command or b"control" not in command or pid <= 1:
+                      stopped = False
+                      continue
+                  os.kill(pid, signal.SIGTERM)
+                  for _ in range(30):
+                      if not proc.exists():
+                          break
+                      time.sleep(0.1)
+                  stopped = stopped and not proc.exists()
+              return stopped
+
+          def actual_cli_version(phase):
+              executable = ROOT / "public" / ("home-" + phase) / ".local/bin/claude"
+              try:
+                  result = subprocess.run([str(executable), "--version"], capture_output=True, text=True, timeout=10)
+                  match = re.fullmatch(r"(\d+\.\d+\.\d+)(?: \(Claude Code\))?\s*", result.stdout) if len(result.stdout) <= 128 else None
+                  return match.group(1) if result.returncode == 0 and match else "UNVERIFIED"
+              except (OSError, subprocess.SubprocessError, UnicodeError):
+                  return "UNVERIFIED"
+
+          def summarize(phase):
+              path = pathlib.Path(os.environ.get("EXECUTION_FILE", "/nonexistent"))
+              messages = []
+              try:
+                  if path.is_file() and path.stat().st_size <= 2097152:
+                      messages = json.loads(path.read_text(encoding="utf-8"))
+                  report = summarize_messages(messages, os.environ.get("ACTION_OUTCOME") == "success", actual_cli_version(phase))
+              except (ValueError, TypeError, KeyError, AttributeError):
+                  report = {"action_success":False, "read_ok":False, "unexpected_tool":True, "init_count":0}
+              write_json(ROOT / "private" / (phase + "-report.json"), report)
+              if phase == "control":
+                  events = load_events("control") or []
+                  write_json(ROOT / "private/stopped.json", stop_controls(events))
+                  if not controls_valid(events) or not report["action_success"] or not report["read_ok"]:
+                      raise SystemExit(1)
+
+          def verify():
+              def read(name, default):
+                  path = ROOT / "private" / name
+                  return json.loads(path.read_text(encoding="utf-8")) if path.exists() else default
+              result = assess({"control":read("control-report.json", {}), "candidate":read("candidate-report.json", {}),
+                  "control_events":load_events("control"), "candidate_events":load_events("candidate"), "control_stopped":read("stopped.json", False)})
+              write_json(ROOT / "private/audit.json", result)
+              print("MCP_PROBE_VERDICT=" + result["verdict"])
+              print("CONTROL_SOURCES=" + str(result["control_source_count"]))
+              print("CANDIDATE_EVENTS=" + str(result["candidate_event_count"]))
+              print("FAILURES=" + ",".join(result["failures"]))
+              print("UNPROVEN=" + ",".join(result["unproven"]))
+              raise SystemExit(0 if result["verdict"] == "MCP_STARTUP_NEGATIVE_PROVEN" else 1)
+
+          if __name__ == "__main__":
+              operation = sys.argv[1]
+              if operation == "setup": setup(sys.argv[2])
+              elif operation == "summarize": summarize(sys.argv[2])
+              elif operation == "verify": verify()
+              elif operation == "unit": print(json.dumps(assess(json.load(sys.stdin))))
+              elif operation == "summarize-unit": print(json.dumps(summarize_messages(json.load(sys.stdin), True)))
+              elif operation == "guard": guard()
+          # END MCP PROBE PYTHON
+          PY
+          python3 "$RUNNER_TEMP/mcp-isolation/public/verifier.py" setup control
+      - name: Install and verify unchanged strict Bash sandbox prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends bubblewrap socat
+          host_net="$(readlink /proc/self/ns/net)"
+          # shellcheck disable=SC2016
+          HOST_NET="$host_net" timeout 15s bwrap --unshare-user --unshare-net \
+            --ro-bind / / --dev-bind /dev /dev --proc /proc --tmpfs /tmp -- /bin/bash -eu -c '
+              test "$(readlink /proc/self/ns/net)" != "$HOST_NET"
+              grep -q "lo:" /proc/net/dev
+              ! grep -Eq "eth[0-9]+:" /proc/net/dev
+              echo BWRAP_SANDBOX_NAMESPACE_READY
+            '
+      - id: control
+        name: Positive control actual Action discovers four synthetic MCP sources
+        uses: anthropics/claude-code-action@6fed3ca145920b639991cb756090506e1bcaf515 # v1
+        env:
+          HOME: ${{ runner.temp }}/mcp-isolation/public/home-control
+        with:
+          github_token: ${{ github.token }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          show_full_output: 'false'
+          prompt: |
+            Read exactly once ${{ runner.temp }}/mcp-isolation/public/control.txt with Read.
+            Do not use any other tool or contact any service. Do not quote file contents.
+            After the Read tool finishes, reply DONE. This is a synthetic startup diagnostic.
+          settings: |
+            {"sandbox":{"enabled":true,"failIfUnavailable":true,"allowUnsandboxedCommands":false,"autoAllowBashIfSandboxed":true,"network":{"allowedDomains":[]},"filesystem":{"denyRead":["~/.config/gh","~/.ssh","~/.aws","~/.claude","/proc/self/environ","/proc/*/environ","${{ runner.temp }}/mcp-isolation/private"]},"credentials":{"envVars":[{"name":"GITHUB_TOKEN","mode":"deny"},{"name":"GH_TOKEN","mode":"deny"},{"name":"CLAUDE_CODE_OAUTH_TOKEN","mode":"deny"},{"name":"BUILDER_PUBLISHER_APP_PRIVATE_KEY","mode":"deny"}]}},"hooks":{"PreToolUse":[{"matcher":".*","hooks":[{"type":"command","command":"python3 ${{ runner.temp }}/mcp-isolation/public/verifier.py guard","timeout":5}]}]},"permissions":{"deny":["Bash","Write","Edit","Glob","Grep","WebFetch","WebSearch","Read(~/.claude/**)","Read(//proc/**)","Read(/${{ runner.temp }}/mcp-isolation/private/**)","Read(/${{ github.workspace }}/.git/**)","Read(/${{ runner.temp }}/claude-execution-output.json)"]}}
+          claude_args: >-
+            --max-turns 5 --allowedTools "Read"
+            --disallowedTools "Bash,Write,Edit,Glob,Grep,WebFetch,WebSearch"
+            --plugin-dir ${{ runner.temp }}/mcp-isolation/public/plugin-control
+      - name: Reduce control evidence and stop owned synthetic MCP processes
+        if: always()
+        shell: bash
+        env:
+          EXECUTION_FILE: ${{ steps.control.outputs.execution_file }}
+          ACTION_OUTCOME: ${{ steps.control.outcome }}
+        run: python3 "$RUNNER_TEMP/mcp-isolation/public/verifier.py" summarize control
+      - name: Prepare fresh candidate HOME and phase-specific fixtures
+        shell: bash
+        run: python3 "$RUNNER_TEMP/mcp-isolation/public/verifier.py" setup candidate
+      - id: candidate
+        name: Actual Action strict candidate must discover and start no fixture MCP
+        uses: anthropics/claude-code-action@6fed3ca145920b639991cb756090506e1bcaf515 # v1
+        env:
+          HOME: ${{ runner.temp }}/mcp-isolation/public/home-candidate
+        with:
+          github_token: ${{ github.token }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          show_full_output: 'false'
+          prompt: |
+            Read exactly once ${{ runner.temp }}/mcp-isolation/public/control.txt with Read.
+            Do not use any other tool or contact any service. Do not quote file contents.
+            After the Read tool finishes, reply DONE. Never change configuration or retry.
+          settings: |
+            {"sandbox":{"enabled":true,"failIfUnavailable":true,"allowUnsandboxedCommands":false,"autoAllowBashIfSandboxed":true,"network":{"allowedDomains":[]},"filesystem":{"denyRead":["~/.config/gh","~/.ssh","~/.aws","~/.claude","/proc/self/environ","/proc/*/environ","${{ runner.temp }}/mcp-isolation/private"]},"credentials":{"envVars":[{"name":"GITHUB_TOKEN","mode":"deny"},{"name":"GH_TOKEN","mode":"deny"},{"name":"CLAUDE_CODE_OAUTH_TOKEN","mode":"deny"},{"name":"BUILDER_PUBLISHER_APP_PRIVATE_KEY","mode":"deny"}]}},"hooks":{"PreToolUse":[{"matcher":".*","hooks":[{"type":"command","command":"python3 ${{ runner.temp }}/mcp-isolation/public/verifier.py guard","timeout":5}]}]},"permissions":{"deny":["Bash","Write","Edit","Glob","Grep","WebFetch","WebSearch","Read(~/.claude/**)","Read(//proc/**)","Read(/${{ runner.temp }}/mcp-isolation/private/**)","Read(/${{ github.workspace }}/.git/**)","Read(/${{ runner.temp }}/claude-execution-output.json)"]}}
+          claude_args: >-
+            --max-turns 5 --allowedTools "Read"
+            --setting-sources user --strict-mcp-config --mcp-config '{"mcpServers":{}}'
+            --disallowedTools "Bash,Write,Edit,Glob,Grep,WebFetch,WebSearch"
+            --plugin-dir ${{ runner.temp }}/mcp-isolation/public/plugin-candidate
+      - name: Reduce candidate evidence without logging model or tool contents
+        if: always()
+        shell: bash
+        env:
+          EXECUTION_FILE: ${{ steps.candidate.outputs.execution_file }}
+          ACTION_OUTCOME: ${{ steps.candidate.outcome }}
+        run: python3 "$RUNNER_TEMP/mcp-isolation/public/verifier.py" summarize candidate
+      - name: Decide only from native discovery, actual Read and host process evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/mcp-isolation/public/verifier.py" verify | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Upload bounded sanitized MCP evidence only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mcp-isolation-audit
+          path: ${{ runner.temp }}/mcp-isolation/private/audit.json
+          if-no-files-found: warn
+          retention-days: 7

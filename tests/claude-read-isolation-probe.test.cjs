@@ -48,6 +48,33 @@ function evaluate(value) {
   return JSON.parse(run.stdout);
 }
 
+function guard(manifest, value) {
+  const block = source().split('          # READ_GUARD_PY_BEGIN\n')[1]?.split('          # READ_GUARD_PY_END')[0];
+  assert.ok(block, 'guard must be the actual embedded trusted code');
+  const code = block.split('\n').map(line => line.startsWith('          ') ? line.slice(10) : line).join('\n');
+  const run = spawnSync(python, ['-c',
+    'import base64,json,sys; scope={"__name__":"probe_test"}; exec(base64.b64decode(sys.argv[1]),scope); p=json.load(sys.stdin); print(json.dumps(scope["guard_decision"](**p)))', Buffer.from(code).toString('base64')],
+  { input: JSON.stringify({ manifest, value }), encoding: 'utf8' });
+  assert.equal(run.status, 0, run.stderr.slice(0, 500));
+  return JSON.parse(run.stdout);
+}
+
+test('safety guard is neutral for every exact planned pair and denies other tool inputs', () => {
+  const { manifest } = fixture();
+  const event = item => ({ hook_event_name: 'PreToolUse', tool_name: item.tool, tool_input: item.input });
+  for (const item of manifest.cases) assert.deepEqual(guard(manifest, event(item)), {});
+  const valid = event(manifest.cases[0]);
+  for (const value of [null, {}, { ...valid, hook_event_name: 'PostToolUse' },
+    { ...valid, tool_name: 'Bash' }, { ...valid, tool_input: { path: '/real/credential' } },
+    { ...valid, tool_input: { ...valid.tool_input, extra: true } }]) {
+    assert.equal(guard(manifest, value).hookSpecificOutput.permissionDecision, 'deny');
+  }
+  for (const broken of [{ cases: [] }, { cases: [...manifest.cases, manifest.cases[0]] }, null]) {
+    assert.equal(guard(broken, valid).hookSpecificOutput.permissionDecision, 'deny');
+  }
+  assert.match(source(), /"hooks": \{"PreToolUse"/);
+});
+
 test('Read diagnostic is owner/repository/ref/SHA gated with explicit read-only credentials', () => {
   const text = source();
   for (const value of [
@@ -55,6 +82,7 @@ test('Read diagnostic is owner/repository/ref/SHA gated with explicit read-only 
     'refs/heads/codex/tool-isolation-runtime-36-37', 'test "$GITHUB_SHA" = "$EXPECTED_SHA"',
     'show_full_output: \'false\'', '--setting-sources user', '--strict-mcp-config',
     '--mcp-config \'{"mcpServers":{}}\'', 'Read(~/.aws/**)',
+    "ENABLE_CLAUDEAI_MCP_SERVERS: 'false'", 'Read(/${{ github.workspace }}/.git/**)',
   ]) assert.ok(text.includes(value), value);
   assert.doesNotMatch(text, /secrets:\s*inherit|contents: write|issues: write|pull-requests: write|id-token: write/);
   assert.doesNotMatch(text, /secrets\.BUILDER_PUBLISHER|allowUnsandboxedCommands": true|--dangerously-skip-permissions/);
@@ -113,4 +141,22 @@ test('unknown CLI, broken fixture controls and mismatched denial identity cannot
   const mismatch = fixture();
   mismatch.messages[2].permission_denials[0].tool_input = { path: '/different' };
   assert.equal(evaluate(mismatch).verdict, 'NOT_PROVEN');
+});
+
+test('empty matrix and conflicting or duplicate result evidence cannot produce PROVEN', () => {
+  const empty = fixture();
+  empty.manifest.cases = [];
+  empty.messages[0].message.content = [];
+  empty.messages[1].message.content = [];
+  empty.messages[2].permission_denials = [];
+  assert.equal(evaluate(empty).verdict, 'NOT_PROVEN');
+  const conflict = fixture();
+  conflict.messages[1].message.content.push({ type: 'tool_result', tool_use_id: 'call-1', content: '' });
+  assert.equal(evaluate(conflict).verdict, 'NOT_PROVEN');
+  const duplicate = fixture();
+  duplicate.messages[1].message.content.push(
+    { type: 'tool_result', tool_use_id: 'call-6', is_error: true, content: '' },
+    { type: 'tool_result', tool_use_id: 'call-6', content: '/fake/.aws/home/denied.txt' },
+  );
+  assert.equal(evaluate(duplicate).verdict, 'READ_ISOLATION_FAIL');
 });
