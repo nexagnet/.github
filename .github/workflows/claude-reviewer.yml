@@ -164,7 +164,7 @@ jobs:
             ui_required=true
             ui_path="$(jq -r '.[0]' <<< "$ui_files")"
             # A path later used in a finding/output must be single-line data.
-            jq -e 'all(.[]; length <= 260 and test("^[^\\u0000-\\u001f\\u007f]+$"))' <<< "$ui_files" >/dev/null
+            jq -e 'all(.[]; length > 0 and length <= 260 and (explode | all(.[]; . >= 32 and . != 127)))' <<< "$ui_files" >/dev/null
           fi
           jq -e 'all(.[]; (.filename | ascii_downcase |
             test("(^|/)(\\.github|\\.claude)/|^infra/|^deploy/|^tools/autopilot/|(^|/)(agents\\.md|claude\\.md|\\.mcp\\.json|\\.env(\\..*)?)$") | not))' <<< "$files" >/dev/null

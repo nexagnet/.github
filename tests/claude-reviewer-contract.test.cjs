@@ -283,6 +283,19 @@ test('trusted UI policy rejects traversal, globs, empty roots and multiline outp
   }
 });
 
+test('UI finding paths accept normal filenames and reject GitHub output control characters', () => {
+  const predicate = preflight.match(/jq -e '(all\(\.\[\]; length > 0[\s\S]*?)' <<< "\$ui_files"/);
+  assert.ok(predicate);
+  for (const [name, expected] of [
+    ['apps/web/page.tsx', true], ['apps/web/a b.tsx', true],
+    ['apps/web/a\nui_required=false', false], ['apps/web/a\u0000b', false],
+    ['apps/web/a\u007fb', false], ['', false], ['a'.repeat(261), false],
+  ]) {
+    const result = spawnSync('jq', ['-e',predicate[1]], {input:JSON.stringify([name]),encoding:'utf8'});
+    assert.equal(result.status === 0, expected, JSON.stringify(name));
+  }
+});
+
 test('parity material is frozen and baseline spec is read without external URLs or execution', () => {
   const step = jobs.review.steps.find(s => s.name === 'Prepare bounded Figma parity context');
   assert.ok(step);
