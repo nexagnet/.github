@@ -60,6 +60,48 @@ Replace APPROVED_FULL_40_CHAR_SHA with a real reviewed immutable commit after th
 
 ## Status
 
+### Project MCP startup containment (#37)
+
+Source change only; **MCP_RUNTIME_PROVEN is not established**. The Builder passes
+`--setting-sources user --strict-mcp-config --mcp-config '{"mcpServers":{}}'`.
+Project/local settings are excluded while the Action's trusted user settings
+continue to provide the existing sandbox and permission configuration. The empty
+central inline MCP configuration is exclusive; repository `.mcp.json`, local/user
+MCP definitions and plugin MCP definitions must not supply additional servers.
+No MCP tools, plugin installation or commit-signing server are requested from the
+Action. This does not grant network access or change Publisher permissions.
+
+At the pinned [Action source](https://github.com/anthropics/claude-code-action/tree/6fed3ca145920b639991cb756090506e1bcaf515):
+
+- `base-action/src/setup-claude-code-settings.ts` unconditionally sets
+  `enableAllProjectMcpServers=true` after merging the settings input. Setting it
+  false in the workflow's `settings` input would therefore be ineffective.
+- `base-action/src/parse-sdk-options.ts` explicitly honors the nonempty `user`
+  setting-source argument; an empty string falls back to all three sources.
+  Other flags pass through the SDK's `extraArgs` to the CLI.
+- `src/modes/agent/index.ts` and `src/mcp/install-mcp-server.ts` only add the
+  Action's MCP servers when the agent requests relevant MCP tools or enables
+  commit signing. This Builder does neither.
+- `src/entrypoints/run.ts` installs Claude Code **2.1.293** unless a custom
+  executable is supplied; this workflow does not supply one.
+
+The official [CLI reference](https://code.claude.com/docs/en/cli-reference)
+documents the exclusive `--strict-mcp-config` behavior and setting-source flag.
+Current vendor documentation supports the design but does not replace evidence
+from the pinned executable. Contract tests check workflow configuration only.
+
+Before merge/readiness, a separately reviewed synthetic runtime probe must plant
+benign marker MCP definitions at project, user/local and plugin sources, prove a
+positive control can start each fixture, then run the actual pinned Action with
+these flags and verify that no unauthorized marker executes. Use only synthetic
+fixtures; emit bounded pass/fail and version information, never tokens or full
+tool transcripts. A successful Action initialization and useful local code/test
+operation are required so a startup failure cannot count as a negative pass.
+Record exact SHA, run ID and independent review. Until this is proven, keep #37
+open, do not enable external MCP or credentials, and do not update consumer pins.
+R3 owner merge, exact-main CI and an independently scoped consumer smoke remain
+required. Roll back through a human-controlled central PR and consumer pin PR.
+
 CENTRAL-SOURCE-VALIDATED requires exact-head tests and independent review.
 CENTRAL-MERGED requires owner merge plus exact-main evidence.
 CONSUMER-RUNTIME-PROVEN additionally requires an approved publisher App, consumer caller and live proof.
