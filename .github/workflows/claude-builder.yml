@@ -242,6 +242,7 @@ jobs:
                   "WebFetch","WebSearch",
                   "Read(//proc/**)","Read(~/.claude/**)",
                   "Read(~/.config/gh/**)","Read(~/.ssh/**)",
+                  "Read(~/.aws/**)",
                   "Edit(.github/**)","Edit(infra/**)","Edit(deploy/**)",
                   "Edit(tools/autopilot/**)","Edit(.claude/**)",
                   "Edit(**/AGENTS.md)","Edit(**/CLAUDE.md)","Edit(.mcp.json)"
