@@ -250,6 +250,9 @@ jobs:
             }
           claude_args: >-
             --max-turns 80
+            --setting-sources user
+            --strict-mcp-config
+            --mcp-config '{"mcpServers":{}}'
             --allowedTools "Read,Glob,Grep,Edit,Write,Bash"
             --disallowedTools "WebFetch,WebSearch"
             --json-schema '{"type":"object","additionalProperties":false,"required":["status","blocker_code","summary","local_checks_attempted"],"properties":{"status":{"enum":["APPLIED","BLOCKED"]},"blocker_code":{"enum":["NONE","UNREADABLE_CONTRACT","AMBIGUOUS_SCOPE","SANDBOX_UNAVAILABLE","TOOL_DENIED","NETWORK_REQUIRED","DEPENDENCY_FAILURE","OTHER"]},"summary":{"type":"string","maxLength":500},"local_checks_attempted":{"type":"boolean"}}}'
