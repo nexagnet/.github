@@ -129,11 +129,17 @@ startup authorization; PR #43 uses native exclusive MCP/setting-source flags.
 Current CLI documentation is supporting evidence, not an executed pin-specific
 startup proof.
 
-Dependency order remains #36/#37/#32 runtime isolation → #40 controlled research
-and trusted MCP capability resolution → #41 authorized read-only runner pilot →
-separately approved draft write → independent visual transport/#22 actual parity
-→ central owner merge/exact-main CI → legal-office R3 pin/pilot → separate platform
-and bmsl rollout. Source work on independent branches does not waive these gates.
+Capability dependencies remain #36/#37/#32 runtime isolation → #40 controlled
+research and trusted MCP capability resolution → #41 authorized read-only runner
+pilot → separately approved draft write → independent visual transport/#22 actual
+parity → legal-office capability pilot → separate platform and bmsl rollout.
+
+Merge gates apply separately within every phase: source changes and the contract's
+required premerge proof → final-HEAD independent review and hosted CI → owner R3
+merge → exact-main CI → separately reviewed consumer R3 SHA pin → consumer runtime
+proof before enabling the next dependent capability. Diagnostic rollout does not
+waive a contract that requires actual-tool proof before implementation merge.
+Source work on independent branches does not waive any gate.
 Each PR needs independent review at its final HEAD and hosted exact-head CI;
 local Windows parser adapters and source checks are not Linux runtime evidence.
 No Issue is closed and no `autopilot:ready` label is granted to an R3 task.
