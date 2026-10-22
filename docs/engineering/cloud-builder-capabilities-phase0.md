@@ -78,6 +78,66 @@ Threat sources: Task Contract/Issue/comments, repository source, project .mcp.js
 
 Figma's setup documents interactive login. This research has **not** located vendor-confirmed GitHub Actions headless provisioning for the remote MCP. This absence of evidence is not proof that such a feature cannot exist.
 
+### Authentication recheck — 2026-10-22
+
+Status: **FIGMA_HEADLESS_AUTH_NOT_PROVEN**. The official
+[remote setup](https://developers.figma.com/docs/figma-mcp-server/remote-server-installation/)
+still requires account sign-in and consent in a supported client. Anthropic's
+[MCP authentication reference](https://code.claude.com/docs/en/mcp#authenticate-with-remote-mcp-servers)
+requires initial interactive authorization. Its no-browser login still needs a
+human to open an authorization URL and paste a callback into a terminal.
+Automatic refresh of an existing authorized session does not establish secure
+bootstrap or renewal on a fresh ephemeral runner. Supplying an OAuth client
+secret configures a client; it does not replace the user's authorization grant.
+No Figma-specific supported service credential, unattended renewal or file-scoped
+MCP token has been established by this investigation. No account authentication,
+credential export or Figma tool call was attempted.
+
+Supported fallback: an explicitly authorized, human-started Claude Code or Codex
+session reads an approved disposable Figma file and supplies design evidence to
+the GitHub workflow. This remains an interactive integration, not headless cloud
+authentication. Figma's [canvas documentation](https://developers.figma.com/docs/figma-mcp-server/write-to-canvas/)
+requires edit access and recommends duplicate/draft testing. Neither a supplied
+file URL nor a prompt restricts the account's other resource permissions.
+Owner consent and an approved test target are required before that separate
+pilot; a write pilot additionally needs explicit draft-write authorization and
+provider/policy-enforced negative cross-file proof.
+
+## Implementation checkpoint — 2026-10-22
+
+Live central main remains `0d253050b996ce7bf5a08a3728f3b1dc97445656`.
+Accessible organization repository inventory contains `.github`, `legal-office`,
+`nexagnet-platform`, and `bmsl-website`. The legal-office Builder caller pins that
+central SHA; its Reviewer caller separately pins
+`7166e745607860e6f8a414548963f83d12c71f9b`. The other two application repositories
+still contain V4 Autopilot workflows. No consumer caller or V4 fallback was changed.
+
+| Work item | Reviewable source | Proven / outstanding |
+|---|---|---|
+| #36 non-Bash credential path | Draft [PR #42](https://github.com/nexagnet/.github/pull/42), `212de4f3439df370876a6611ec0f9fb67444320f` | Explicit AWS Read denial; independent source review; [exact-head CI](https://github.com/nexagnet/.github/actions/runs/39743840559) 44/44 PASS. Actual Read/Glob/Grep denial NOT_PROVEN; not merge-ready. |
+| #37 project MCP startup | Draft [PR #43](https://github.com/nexagnet/.github/pull/43), `26d123f73719cb8b74760274b46f77bcf52fbb6f` | Exclusive empty central MCP config and trusted user settings only; independent source review; [exact-head CI](https://github.com/nexagnet/.github/actions/runs/39743893359) 46/46 PASS. Actual Action marker startup proof NOT_PROVEN; not merge-ready. |
+| #32 negative evidence | Existing [PR #35](https://github.com/nexagnet/.github/pull/35) | Reused existing listener repair; added exact marker inventory and explicit credential outcomes so missing/duplicate/conflicting observations cannot yield PROVEN. Actual Claude sandbox test still required. |
+| #22 visual Reviewer | Draft [PR #44](https://github.com/nexagnet/.github/pull/44) | Trusted UI detection, frozen PR/base-spec context, deterministic REQUEST_CHANGES while image transport is NOT_VERIFIED. No visual comparison or Figma parity PASS claimed. |
+| #40 public egress | Existing Issue, no network enabled | BLOCKED by unproven #36/#37/#32. Keep current bwrap network isolation; do not treat source CI as runtime authorization. |
+| #41 Figma auth | Vendor-source investigation above | FIGMA_HEADLESS_AUTH_NOT_PROVEN; no credentials or external writes. |
+
+The pinned [Action settings implementation](https://github.com/anthropics/claude-code-action/blob/6fed3ca145920b639991cb756090506e1bcaf515/base-action/src/setup-claude-code-settings.ts)
+unconditionally sets `enableAllProjectMcpServers=true` **after** input merge.
+Its [launcher](https://github.com/anthropics/claude-code-action/blob/6fed3ca145920b639991cb756090506e1bcaf515/src/entrypoints/run.ts)
+selects Claude Code **2.1.293**. A false setting in workflow JSON would not solve
+startup authorization; PR #43 uses native exclusive MCP/setting-source flags.
+Current CLI documentation is supporting evidence, not an executed pin-specific
+startup proof.
+
+Dependency order remains #36/#37/#32 runtime isolation → #40 controlled research
+and trusted MCP capability resolution → #41 authorized read-only runner pilot →
+separately approved draft write → independent visual transport/#22 actual parity
+→ central owner merge/exact-main CI → legal-office R3 pin/pilot → separate platform
+and bmsl rollout. Source work on independent branches does not waive these gates.
+Each PR needs independent review at its final HEAD and hosted exact-head CI;
+local Windows parser adapters and source checks are not Linux runtime evidence.
+No Issue is closed and no `autopilot:ready` label is granted to an R3 task.
+
 ## Phased implementation, independent R3 gates
 
 ### Phase 0 — this Issue / this PR
