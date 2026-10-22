@@ -62,6 +62,11 @@ It contains no fixture value, file content, raw tool response, actual token or
 transcript. The raw execution file and private manifest remain local and are
 explicitly denied to Read. Artifact retention is seven days.
 
+Verifier failures include bounded stage and error-class enums, never exception
+messages, paths or transcript data. SDK system/progress messages are excluded
+from tool-content parsing; assistant/user evidence still follows the strict
+case, response and native denial requirements above.
+
 Record caller and central SHA, Action/CLI version, run URL, sanitized artifact
 ID/digest, verifier verdict and independent review on canonical #36. Preserve
 per-tool and per-alias gaps rather than collapsing them into a security PASS.

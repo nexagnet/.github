@@ -59,6 +59,66 @@ function guard(manifest, value) {
   return JSON.parse(run.stdout);
 }
 
+function integration(messages, invalidExecution = false) {
+  const script = `import base64,json,sys,tempfile,pathlib,os
+from unittest.mock import patch
+from types import SimpleNamespace
+scope={"__name__":"probe_test"}
+exec(base64.b64decode(sys.argv[1]),scope)
+p=json.load(sys.stdin)
+with tempfile.TemporaryDirectory() as folder:
+ root=pathlib.Path(folder); base=root/'read-probe'; home=base/'home'; private=base/'private'
+ private.mkdir(parents=True); (home/'public').mkdir(parents=True)
+ manifest=p['manifest']; manifest['home']=str(home)
+ (home/'public/control.txt').write_text(manifest['control_value'])
+ for alias in ['home','absolute','symlink','normalized']:
+  target=home/'.aws'/alias; target.mkdir(parents=True); (target/'denied.txt').write_text(manifest['denied_value'])
+ (private/'manifest.json').write_text(json.dumps(manifest))
+ execution=root/'claude-execution-output.json'; execution.write_text('invalid-json' if p['invalid'] else json.dumps(p['messages']))
+ env={'RUNNER_TEMP':folder,'EXECUTION_FILE':str(execution),'ACTION_OUTCOME':'success','GITHUB_SHA':'a'*40,'GITHUB_RUN_ID':'123','GITHUB_STEP_SUMMARY':str(root/'summary')}
+ original_resolve=pathlib.Path.resolve
+ def resolve_alias(path,*args,**kwargs):
+  return original_resolve(home/'.aws') if path == home/'public/alias' else original_resolve(path,*args,**kwargs)
+ with patch.dict(os.environ,env), patch.object(pathlib.Path,'resolve',resolve_alias), patch.object(scope['subprocess'],'run',return_value=SimpleNamespace(returncode=0,stdout='2.1.293 (Claude Code)')):
+  try: scope['main']()
+  except SystemExit as error: status=error.code
+ proof=json.loads((base/'proof.json').read_text()); print('TEST_PROOF='+json.dumps({'proof':proof,'status':status}))
+`;
+  const value = fixture();
+  const run = spawnSync(python, ['-c', script, Buffer.from(verifier()).toString('base64')],
+    { input: JSON.stringify({ manifest: value.manifest, messages, invalid: invalidExecution }), encoding: 'utf8' });
+  assert.equal(run.status, 0, run.stderr.slice(0, 500));
+  return JSON.parse(run.stdout.split('TEST_PROOF=')[1]);
+}
+
+test('main accepts SDK non-content progress without losing actual native case evidence', () => {
+  const messages = [...fixture().messages, { type: 'system', message: 'progress' },
+    { type: 'system', message: null }, { type: 'system', message: { content: 'status' } }];
+  const result = integration(messages);
+  assert.equal(result.status, 0);
+  assert.equal(result.proof.verdict, 'READ_ISOLATION_PROVEN');
+});
+
+test('main invalid transcript emits bounded stage and class only', () => {
+  const result = integration([], true);
+  assert.equal(result.status, 1);
+  assert.equal(result.proof.verdict, 'NOT_PROVEN');
+  assert.equal(result.proof.verifier_stage, 'EXECUTION_PARSE');
+  assert.equal(result.proof.verifier_error, 'JSON_INVALID');
+  assert.doesNotMatch(JSON.stringify(result.proof), /invalid-json|Traceback|TemporaryDirectory/);
+});
+
+test('main rejects malformed or wrong-role tool evidence with safe diagnostics', () => {
+  for (const extra of [{ type: 'assistant', message: 'malformed' },
+    { type: 'user', message: { content: [fixture().messages[0].message.content[0]] } }]) {
+    const result = integration([...fixture().messages, extra]);
+    assert.equal(result.status, 1);
+    assert.equal(result.proof.verdict, 'NOT_PROVEN');
+    assert.equal(result.proof.verifier_stage, 'EVIDENCE_EVALUATE');
+    assert.ok(['SHAPE_INVALID', 'VALUE_INVALID'].includes(result.proof.verifier_error));
+  }
+});
+
 test('safety guard is neutral for every exact planned pair and denies other tool inputs', () => {
   const { manifest } = fixture();
   const event = item => ({ hook_event_name: 'PreToolUse', tool_name: item.tool, tool_input: item.input });
@@ -95,6 +155,28 @@ test('all three controls and twelve authoritative native denials prove the scope
   const result = evaluate(fixture());
   assert.equal(result.verdict, 'READ_ISOLATION_PROVEN');
   assert.equal(result.cases.length, 15);
+});
+
+test('missing null empty and non-string native identities cannot prove isolation', () => {
+  for (const identity of [undefined, null, '', 7, {}, []]) {
+    const value = fixture();
+    const call = value.messages[0].message.content[1];
+    const denial = value.messages[2].permission_denials[0];
+    if (identity === undefined) { delete call.id; delete denial.tool_use_id; }
+    else { call.id = identity; denial.tool_use_id = identity; }
+    const result = integration(value.messages);
+    assert.equal(result.proof.verdict, 'NOT_PROVEN');
+    assert.equal(result.status, 1);
+  }
+  for (const record of ['result', 'denial']) {
+    for (const identity of [undefined, null, '', '   ', 7, {}, []]) {
+      const value = fixture();
+      const target = record === 'result' ? value.messages[1].message.content[0] : value.messages[2].permission_denials[0];
+      if (identity === undefined) delete target.tool_use_id;
+      else target.tool_use_id = identity;
+      assert.equal(integration(value.messages).proof.verdict, 'NOT_PROVEN');
+    }
+  }
 });
 
 test('missing or duplicate actual calls cannot prove denial', () => {
