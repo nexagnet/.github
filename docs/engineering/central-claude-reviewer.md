@@ -58,3 +58,15 @@ BMSL currently has verify+integration. Platform has seven required CI jobs, so r
 5. If errors, disable only the new consumer caller via R3 owner-approved PR. V4 is fallback. Do not auto-merge R2/R3 or deploy production.
 
 No App installation, secret provisioning, repo ruleset or production changes are authorized by this file.
+
+## UI/Figma parity guard — Issue #22 (source implemented, runtime NOT VERIFIED)
+
+The trusted default-branch caller can declare `ui_paths_csv` (comma-separated directory roots, default `apps/web`) and `figma_parity_spec_path` (default `docs/design/figma-parity.md`). `apps/web` is always included. Directory matching covers additions, deletions and both sides of a rename without matching `apps/website`. Caller policy is validated; Issue/PR text cannot disable it.
+
+For UI changes, the reviewer reads a bounded frozen PR body and a parity specification taken from verified PR BASE. The PR should contain a "Đối chiếu Figma" section with Figma file/node, design image, runtime image bound to current HEAD, states/viewports, and approved differences. The specification is data, and a PR cannot replace the baseline specification used for its own review. No external image URL is fetched by this change.
+
+**Current limitation:** the read-only review lane has no independently verified Figma/runtime screenshot transport. Consequently the trusted reporter always records `figma_parity_status: NOT_VERIFIED` and `REQUEST_CHANGES` for UI changes, even if Claude claims PASS. Non-UI reviews retain their behavior and record `NOT_REQUIRED`. This prevents an unsupported visual PASS; it does not implement authenticated Figma parity or satisfy the complete acceptance for #22. A separately reviewed evidence transport and actual visual runtime proof are still required before UI can pass. Missing parity evidence is an external evidence blocker, not a request for Repair to fabricate images or credentials. Existing bounded retry policy must still apply.
+
+The evidence remains `nexagnet-review-v1`, with the existing `review.head_sha`, `review.verdict`, `review.diff_inspected` and findings consumed by Repair. Each result remains tied to the current HEAD and is revalidated before publication. No merge permission is granted.
+
+Rollout requires central R3 owner merge, exact-main CI and a separate consumer R3 immutable-SHA repin; this source PR does not activate the guard in existing pinned callers. Rollback is a consumer repin to its previously reviewed central SHA. Do not roll out to UI consumers expecting automatic visual acceptance until the remaining transport gate is resolved.

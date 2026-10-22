@@ -263,6 +263,26 @@ test('actual UI path classifier catches additions, deletions and moves without p
   }
 });
 
+test('trusted UI policy rejects traversal, globs, empty roots and multiline output injection', () => {
+  const predicate = preflight.match(/jq -en --arg roots "\$UI_PATHS" --arg spec "\$SPEC_PATH" '([\s\S]*?)' >\/dev\/null/);
+  assert.ok(predicate);
+  const cases = [
+    ['apps/web', 'docs/design/figma-parity.md', true],
+    ['apps/web,src/ui', 'docs/parity.md', true],
+    ['', 'docs/parity.md', false],
+    ['apps/../web', 'docs/parity.md', false],
+    ['apps/web/**', 'docs/parity.md', false],
+    ['apps/web\nui_required=false', 'docs/parity.md', false],
+    ['apps/web', '../parity.md', false],
+    ['apps/web', '/tmp/parity.md', false],
+    ['apps/web', 'docs/parity.txt', false],
+  ];
+  for (const [roots, spec, expected] of cases) {
+    const result = spawnSync('jq', ['-en','--arg','roots',roots,'--arg','spec',spec,predicate[1]], {encoding:'utf8'});
+    assert.equal(result.status === 0, expected, JSON.stringify({roots,spec}));
+  }
+});
+
 test('parity material is frozen and baseline spec is read without external URLs or execution', () => {
   const step = jobs.review.steps.find(s => s.name === 'Prepare bounded Figma parity context');
   assert.ok(step);
