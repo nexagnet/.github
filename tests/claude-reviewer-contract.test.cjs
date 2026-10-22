@@ -231,3 +231,99 @@ test('trusted Reporter revalidates manual consent and contract after AI review',
   assert.equal(jobs.review.permissions['pull-requests'], 'read');
   assert.equal(jobs.report.permissions['pull-requests'], 'write');
 });
+
+test('UI parity is configured only by trusted caller and detects renamed UI paths', () => {
+  const caller = (workflow.on || workflow.true).workflow_call;
+  assert.equal(caller.inputs.ui_paths_csv.default, 'apps/web');
+  assert.equal(caller.inputs.figma_parity_spec_path.default, 'docs/design/figma-parity.md');
+  assert.equal(jobs.gate.outputs.ui_required, '${{ steps.verify.outputs.ui_required }}');
+  assert.match(preflight, /previous_filename/);
+  assert.match(preflight, /UI_PATHS/);
+  assert.match(preflight, /pr_body_b64/);
+});
+
+test('actual UI path classifier catches additions, deletions and moves without prefix collisions', () => {
+  const predicate = preflight.match(/# BEGIN UI CLASSIFIER\n[\s\S]*?jq -c --arg roots "\$UI_PATHS" '([\s\S]*?)' <<< "\$files"/);
+  assert.ok(predicate, 'classifier must be executable independently');
+  const cases = [
+    [[{filename:'apps/web/page.tsx'}], true],
+    [[{filename:'apps/web/page.tsx',status:'removed'}], true],
+    [[{filename:'docs/moved.tsx',previous_filename:'apps/web/page.tsx'}], true],
+    [[{filename:'apps/portal/page.tsx'}], true],
+    [[{filename:'apps/website/page.tsx'}], false],
+    [[{filename:'docs/readme.md'}], false],
+    [[], false],
+  ];
+  for (const [files, expected] of cases) {
+    const result = spawnSync('jq', ['-c','--arg','roots','apps/web,apps/portal',predicate[1]], {
+      input: JSON.stringify(files), encoding:'utf8'
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout).length > 0, expected, JSON.stringify(files));
+  }
+});
+
+test('trusted UI policy rejects traversal, globs, empty roots and multiline output injection', () => {
+  const predicate = preflight.match(/jq -en --arg roots "\$UI_PATHS" --arg spec "\$SPEC_PATH" '([\s\S]*?)' >\/dev\/null/);
+  assert.ok(predicate);
+  const cases = [
+    ['apps/web', 'docs/design/figma-parity.md', true],
+    ['apps/web,src/ui', 'docs/parity.md', true],
+    ['', 'docs/parity.md', false],
+    ['apps/../web', 'docs/parity.md', false],
+    ['apps/web/**', 'docs/parity.md', false],
+    ['apps/web\nui_required=false', 'docs/parity.md', false],
+    ['apps/web', '../parity.md', false],
+    ['apps/web', '/tmp/parity.md', false],
+    ['apps/web', 'docs/parity.txt', false],
+  ];
+  for (const [roots, spec, expected] of cases) {
+    const result = spawnSync('jq', ['-en','--arg','roots',roots,'--arg','spec',spec,predicate[1]], {encoding:'utf8'});
+    assert.equal(result.status === 0, expected, JSON.stringify({roots,spec}));
+  }
+});
+
+test('UI finding paths accept normal filenames and reject GitHub output control characters', () => {
+  const predicate = preflight.match(/jq -e '(all\(\.\[\]; length > 0[\s\S]*?)' <<< "\$ui_files"/);
+  assert.ok(predicate);
+  for (const [name, expected] of [
+    ['apps/web/page.tsx', true], ['apps/web/a b.tsx', true],
+    ['apps/web/a\nui_required=false', false], ['apps/web/a\u0000b', false],
+    ['apps/web/a\u007fb', false], ['', false], ['a'.repeat(261), false],
+  ]) {
+    const result = spawnSync('jq', ['-e',predicate[1]], {input:JSON.stringify([name]),encoding:'utf8'});
+    assert.equal(result.status === 0, expected, JSON.stringify(name));
+  }
+});
+
+test('parity material is frozen and baseline spec is read without external URLs or execution', () => {
+  const step = jobs.review.steps.find(s => s.name === 'Prepare bounded Figma parity context');
+  assert.ok(step);
+  assert.equal(step.if, "needs.gate.outputs.ui_required == 'true'");
+  assert.equal(step.env.BASE, '${{ needs.gate.outputs.base_sha }}');
+  assert.equal(step.env.PR_BODY_B64, '${{ needs.gate.outputs.pr_body_b64 }}');
+  assert.match(step.run, /git show "\$BASE:\$SPEC_PATH"/);
+  assert.doesNotMatch(step.run, /curl|wget|gh api|eval/);
+  assert.match(reviewer.with.prompt, /Đối chiếu Figma/);
+  assert.match(reviewer.with.prompt, /NOT_VERIFIED/);
+});
+
+test('UI visual proof remains deterministically unverified even when model claims PASS', () => {
+  const guard = reporter.match(/# BEGIN UI PARITY GUARD\n[\s\S]*?RESULT="\$\(jq --arg path "\$UI_PATH" '([\s\S]*?)' <<< "\$RESULT"\)"/);
+  assert.ok(guard);
+  for (const verdict of ['PASS','REQUEST_CHANGES']) {
+    const result = spawnSync('jq', ['--arg','path','apps/web/page.tsx',guard[1]], {
+      input: JSON.stringify({head_sha:'a'.repeat(40),diff_inspected:true,verdict,summary:'review',findings:[]}),encoding:'utf8'
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const review = JSON.parse(result.stdout);
+    assert.equal(review.verdict, 'REQUEST_CHANGES');
+    assert.equal(review.head_sha, 'a'.repeat(40));
+    assert.equal(review.diff_inspected, true);
+    assert.equal(review.findings[0].severity, 'blocker');
+    assert.match(review.findings[0].message, /VISUAL_EVIDENCE_NOT_VERIFIED/);
+  }
+  assert.match(reporter, /figma_parity_status/);
+  assert.match(reporter, /NOT_REQUIRED/);
+  assert.match(reporter, /NOT_VERIFIED/);
+});
