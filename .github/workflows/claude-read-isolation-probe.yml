@@ -197,7 +197,7 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           # READ_VERIFY_PY_BEGIN
-          import json, os, pathlib, re, subprocess
+          import json, os, pathlib, posixpath, re, subprocess
 
           def content_text(value):
               if isinstance(value, str):
@@ -236,7 +236,36 @@ jobs:
                           results.setdefault(block.get('tool_use_id'), []).append(block)
               return calls, results, final
 
-          def observe_case(case, entries, results, denials, control_value):
+          def native_diagnostics(call, recorded, response, home):
+              # Bounded flags only: never emit raw input, path or content.
+              expected = call.get('input', {})
+              inputs = [d.get('tool_input') for d in recorded if isinstance(d.get('tool_input'), dict)]
+              def strings(source):
+                  return [v for v in source.values() if isinstance(v, str)]
+              def expansion(text):
+                  if isinstance(home, str) and (text == '~' or text.startswith('~/')):
+                      text = home + text[1:]
+                  return posixpath.normpath(text) if text.startswith('/') else text
+              def dotdot(text):
+                  return '/../' in text or text.endswith('/..')
+              call_text = strings(expected)
+              denial_text = [t for item in inputs for t in strings(item)]
+              kinds = lambda source: {k: type(v).__name__ for k, v in source.items()}
+              return {'id_denials': min(len(recorded), 9),
+                      'tool_name_match': any(d.get('tool_name') == call.get('name') for d in recorded),
+                      'input_keys_match': any(set(i) == set(expected) for i in inputs),
+                      'input_types_match': any(kinds(i) == kinds(expected) for i in inputs),
+                      'exact_input_match': any(i == expected for i in inputs),
+                      'call_has_tilde': any(t.startswith('~') for t in call_text),
+                      'call_has_dotdot': any(dotdot(t) for t in call_text),
+                      'denial_has_tilde': any(t.startswith('~') for t in denial_text),
+                      'denial_has_dotdot': any(dotdot(t) for t in denial_text),
+                      'denial_is_expansion_of_call': any(
+                          {k: (expansion(v) if isinstance(v, str) else v) for k, v in expected.items()} == i for i in inputs),
+                      'result_count': min(len(response), 9),
+                      'result_error_count': min(sum(r.get('is_error', False) is not False for r in response), 9)}
+
+          def observe_case(case, entries, results, denials, control_value, home=None):
               reasons, failures = [], []
               observation = {'id': case['id'], 'tool': case['tool'], 'kind': case['kind'],
                              'calls': len(entries), 'native_denial': False, 'outcome': 'NOT_PROVEN'}
@@ -247,6 +276,7 @@ jobs:
               matched = [d for d in recorded if d.get('tool_name') == call.get('name') and input_matches(d.get('tool_input'), call.get('input'))]
               observation['native_denial'] = len(matched) == 1 and len(recorded) == 1
               response = results.get(call.get('id'), [])
+              observation['native_diag'] = native_diagnostics(call, recorded, response, home)
               successful = [r for r in response if r.get('is_error', False) is False]
               text = content_text(response[0].get('content', '')) if len(response) == 1 else ''
               if case['kind'] == 'control':
@@ -296,7 +326,7 @@ jobs:
                   mapped.setdefault(matches[0]['id'], []).append(call)
               observations = []
               for case in cases:
-                  observation, unproven, exposed = observe_case(case, mapped.get(case['id'], []), results, denials, manifest['control_value'])
+                  observation, unproven, exposed = observe_case(case, mapped.get(case['id'], []), results, denials, manifest['control_value'], manifest.get('home'))
                   reasons.extend(unproven)
                   failures.extend(exposed)
                   observations.append(observation)

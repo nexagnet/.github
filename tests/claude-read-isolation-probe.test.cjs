@@ -242,3 +242,31 @@ test('empty matrix and conflicting or duplicate result evidence cannot produce P
   );
   assert.equal(evaluate(duplicate).verdict, 'READ_ISOLATION_FAIL');
 });
+
+test('native mismatch diagnostics are bounded flags, never raw input, and never relax acceptance', () => {
+  const value = fixture();
+  value.manifest.home = '/fake';
+  value.manifest.cases[1].input = { path: '~/.aws/home/denied.txt' };
+  value.manifest.cases[4].input = { path: '/fake/public/../.aws/normalized/denied.txt' };
+  value.messages[0].message.content[1].input = value.manifest.cases[1].input;
+  value.messages[0].message.content[4].input = value.manifest.cases[4].input;
+  const denials = value.messages[2].permission_denials;
+  denials.find(d => d.tool_use_id === 'call-1').tool_input = { path: '/fake/.aws/home/denied.txt' };
+  denials.find(d => d.tool_use_id === 'call-4').tool_input = { path: '/fake/.aws/normalized/denied.txt' };
+  const result = evaluate(value);
+  assert.equal(result.verdict, 'NOT_PROVEN');
+  for (const id of ['Read-home', 'Read-normalized']) {
+    const item = result.cases.find(c => c.id === id);
+    assert.equal(item.native_denial, false);
+    assert.equal(item.outcome, 'NOT_PROVEN');
+    assert.deepEqual(item.native_diag, {
+      id_denials: 1, tool_name_match: true, input_keys_match: true, input_types_match: true,
+      exact_input_match: false, call_has_tilde: id === 'Read-home', call_has_dotdot: id === 'Read-normalized',
+      denial_has_tilde: false, denial_has_dotdot: false, denial_is_expansion_of_call: true,
+      result_count: 0, result_error_count: 0,
+    });
+  }
+  assert.doesNotMatch(JSON.stringify(result), /\/fake\/|denied\.txt|\.\.\//);
+  const exact = result.cases.find(c => c.id === 'Read-absolute');
+  assert.equal(exact.native_diag.exact_input_match, true);
+});
