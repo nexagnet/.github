@@ -35,20 +35,26 @@ The trusted verifier reads this local transcript without printing or uploading
 it. It pairs actual assistant `tool_use` records with user `tool_result` records,
 and identifies native denials by the final SDK result's `permission_denials`
 entries with matching tool name, input and tool-use ID. A safety PreToolUse guard
-denies calls outside the fifteen exact tool/input pairs in the private manifest.
+denies calls outside the seventeen exact tool/input pairs in the private manifest.
 For planned pairs it returns `{}` without any allow or deny decision, leaving
 native permission evaluation authoritative. Guard denials are never native proof.
 
-Fifteen fixed cases cover Read, Glob and Grep: one readable positive control per
+The original fifteen cases cover Read, Glob and Grep: one readable positive control per
 tool and four denied targets per tool (home-relative, absolute, symlink and `..`
 alias). Each alias uses a distinct fixture directory so evidence remains
 attributable. Calls are exact and occur once; missing, duplicate or unexpected
 calls fail closed. The host independently checks fixture contents and symlink
 target before accepting results. Positive Read/Grep responses must contain the
-unpublished random control marker; Glob must identify the control file.
+unpublished random control marker; Glob must identify the control file. Two additional
+Read controls use `~/public/control-home.txt` and the synthetic HOME's
+`public/step/../control-normalized.txt`. Both have distinct readable fixture files,
+and the intermediate `step` directory exists. The original negative inputs, including
+their literal `~` and `..`, remain unchanged.
 
-`READ_ISOLATION_PROVEN` requires all three controls and twelve authoritative native
-denials with a successful Action/result and the expected CLI. A filtered-empty
+`READ_ISOLATION_PROVEN` requires all five controls and twelve authoritative native
+denials with a successful Action/result and the expected CLI. Each accepted negative
+also requires exactly one correlated `is_error=true` tool result and one valid neutral
+guard audit record. A missing result cannot establish native-policy proof. A filtered-empty
 Glob/Grep result, a generic failure, missing denial ledger, skipped alias or tool,
 ambiguous result, unexpected version, or unsuccessful Action is `NOT_PROVEN`.
 Denied synthetic content in any raw message or a successful Glob result exposing
@@ -56,10 +62,44 @@ the denied file gives `READ_ISOLATION_FAIL`, even alongside a denial record.
 
 ## Evidence and limits
 
+### Guard audit and proof schema v2
+
+The guard writes one bounded private JSONL record before returning its decision.
+The audit file starts empty with mode 0600 under the existing private directory.
+Appending uses a bounded exclusive lock and a single `O_APPEND` write, rejects
+symlinks/nonregular files, and fails closed on audit I/O or locking errors. The
+Ubuntu path also enforces ownership and `O_NOFOLLOW`; Windows tests exercise its
+equivalent serialized append behavior. Audit records retain only a SHA-256 of the
+actual tool-use ID, tool/decision enums, exact/expanded manifest indices and alias
+booleans. They contain no raw ID, input, path, fixture content or exception text.
+
+The trusted verifier binds each audit hash to the actual SDK call and requires its
+exact manifest index and tool to match that call's case. An audit neutral for some
+other case is insufficient. Missing, duplicate, malformed, unknown-ID or denied
+audit evidence prevents that case from receiving `NATIVE_DENIED` credit; invalid
+audit input fails the overall proof closed. Explicit guard-denial/error results
+and available SDK hook-response errors or decisions also prevent native-policy
+credit, including a failure after a neutral audit append. The verifier does not
+assume that SDK hook stdout is always available. Exposure detection retains FAIL
+priority even when audit evidence is absent or invalid.
+
+Sanitized `guard_diag` fields contain booleans and capped counts only. They identify
+whether the hook saw an exact planned input, an expanded variant, and whether its
+decision was neutral or denied. Expansion comparison remains observational: it
+never changes guard neutrality or the exact native ledger acceptance rule. This
+distinguishes a guard intervention before native permission evaluation from a
+later ledger representation mismatch without claiming either as successful proof.
+
+This version emits `nexagnet-read-isolation-v2`: 17 cases, five positive controls
+and mandatory guard audit. Earlier v1 artifacts have 15 cases and no audit and
+must not be reinterpreted as satisfying v2. Re-run only the reviewed, immutable
+source/caller after exact-head CI; preserve prior artifacts and their original
+verdicts. No production Builder or MCP workflow change is part of this migration.
+
 Only `read-isolation-proof` is uploaded: bounded case IDs, tool names, counts,
-native-denial booleans, outcome enums, static failure reasons, run ID and SHA.
+native-denial booleans, guard diagnostic flags/counts, outcome enums, static failure reasons, run ID and SHA.
 It contains no fixture value, file content, raw tool response, actual token or
-transcript. The raw execution file and private manifest remain local and are
+transcript. Raw audit JSONL and its ID hashes are not uploaded. The raw execution file and private manifest remain local and are
 explicitly denied to Read. Artifact retention is seven days.
 
 Verifier failures include bounded stage and error-class enums, never exception

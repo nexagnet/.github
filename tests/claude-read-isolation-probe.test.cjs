@@ -37,6 +37,8 @@ function fixture() {
   const denials = cases.filter(item => item.kind === 'denied').map(item => ({
     tool_name: item.tool, tool_use_id: calls[cases.indexOf(item)].id, tool_input: item.input,
   }));
+  results.push(...denials.map(denial => ({ type: 'tool_result', tool_use_id: denial.tool_use_id,
+    is_error: true, content: 'Synthetic native permission denial' })));
   const guard_events = calls.map((call, index) => ({
     schema: 'read-guard-audit-v1', id_sha256: createHash('sha256').update(call.id).digest('hex'),
     tool: call.name, decision: 'neutral', case_index: index, expanded_case_index: index,
@@ -69,7 +71,7 @@ function guard(manifest, value) {
   return JSON.parse(run.stdout);
 }
 
-function guardProcesses(manifest, events, brokenAudit = false) {
+function guardProcesses(manifest, events, brokenAudit = false, postWriteFailure = false) {
   const block = source().split('          # READ_GUARD_PY_BEGIN\n')[1]?.split('          # READ_GUARD_PY_END')[0];
   const code = block.split('\n').map(line => line.startsWith('          ') ? line.slice(10) : line).join('\n');
   const script = `import base64,json,sys,tempfile,pathlib,os,subprocess,concurrent.futures
@@ -80,7 +82,10 @@ with tempfile.TemporaryDirectory() as folder:
  audit=private/'guard-audit.jsonl'
  if p['broken']: audit.mkdir()
  else: audit.touch(mode=0o600)
- guard=private/'guard.py'; guard.write_bytes(base64.b64decode(sys.argv[1]))
+ code=base64.b64decode(sys.argv[1]).decode()
+ if p['post_write']:
+  code=code.replace('    main()', '    original_close = os.close\\n    def failing_close(descriptor):\\n        original_close(descriptor)\\n        raise OSError("synthetic post-write close failure")\\n    os.close = failing_close\\n    main()')
+ guard=private/'guard.py'; guard.write_text(code)
  env=dict(os.environ,RUNNER_TEMP=folder)
  def invoke(event):
   run=subprocess.run([sys.executable,str(guard)],input=json.dumps(event),capture_output=True,text=True,env=env)
@@ -91,7 +96,7 @@ with tempfile.TemporaryDirectory() as folder:
  print(json.dumps({'decisions':decisions,'records':records,'mode':audit.stat().st_mode & 0o777}))
 `;
   const run = spawnSync(python, ['-c', script, Buffer.from(code).toString('base64')], {
-    input: JSON.stringify({ manifest, events, broken: brokenAudit }), encoding: 'utf8',
+    input: JSON.stringify({ manifest, events, broken: brokenAudit, post_write: postWriteFailure }), encoding: 'utf8',
   });
   assert.equal(run.status, 0, run.stderr.slice(0, 500));
   return JSON.parse(run.stdout);
@@ -116,6 +121,7 @@ with tempfile.TemporaryDirectory() as folder:
  (private/'manifest.json').write_text(json.dumps(manifest))
  if p['audit'] is not None:
   (private/'guard-audit.jsonl').write_text(''.join(json.dumps(event)+'\\n' for event in p['audit']))
+  (private/'guard-audit.jsonl').chmod(0o600)
  execution=root/'claude-execution-output.json'; execution.write_text('invalid-json' if p['invalid'] else json.dumps(p['messages']))
  env={'RUNNER_TEMP':folder,'EXECUTION_FILE':str(execution),'ACTION_OUTCOME':'success','GITHUB_SHA':'a'*40,'GITHUB_RUN_ID':'123','GITHUB_STEP_SUMMARY':str(root/'summary')}
  original_resolve=pathlib.Path.resolve
@@ -209,6 +215,8 @@ test('actual concurrent guard processes append bounded private evidence before n
   assert.equal(result.records.length, 17);
   assert.ok(result.decisions.every(decision => Object.keys(decision).length === 0));
   assert.equal(new Set(result.records.map(record => record.id_sha256)).size, 17);
+  assert.equal(result.records.find(record => record.case_index === 15).has_tilde, true);
+  assert.equal(result.records.find(record => record.case_index === 16).has_dotdot, true);
   for (const record of result.records) {
     assert.match(record.id_sha256, /^[0-9a-f]{64}$/);
     assert.equal(record.decision, 'neutral');
@@ -221,6 +229,36 @@ test('actual concurrent guard processes append bounded private evidence before n
   assert.equal(broken.decisions[0].hookSpecificOutput.permissionDecision, 'deny');
   const invalid = guardProcesses(manifest, [{ ...events[0], tool_use_id: null }]);
   assert.equal(invalid.decisions[0].hookSpecificOutput.permissionDecision, 'deny');
+  const late = guardProcesses(manifest, [events[1]], false, true);
+  assert.equal(late.records[0].decision, 'neutral');
+  assert.equal(late.decisions[0].hookSpecificOutput.permissionDecision, 'deny');
+});
+
+test('explicit guard denial or hook failure cannot be credited as native-policy proof', () => {
+  for (const error of ['Outside the synthetic file-tool case matrix or audit unavailable', 'PreToolUse hook error: synthetic timeout']) {
+    const value = fixture();
+    value.messages[1].message.content.push({ type: 'tool_result', tool_use_id: 'call-1', is_error: true, content: error });
+    const result = evaluate(value);
+    assert.equal(result.verdict, 'NOT_PROVEN');
+    assert.equal(result.cases[1].guard_diag.guard_neutral, false);
+    assert.equal(result.cases[1].native_denial, false);
+    assert.equal(result.cases[1].outcome, 'NOT_PROVEN');
+  }
+  const value = fixture();
+  value.messages.push({ type: 'system', subtype: 'hook_response', hook_event: 'PreToolUse', outcome: 'error', exit_code: 1 });
+  assert.equal(evaluate(value).verdict, 'NOT_PROVEN');
+  const stdoutDeny = fixture();
+  stdoutDeny.messages.push({ type: 'system', subtype: 'hook_response', hook_event: 'PreToolUse', outcome: 'success', exit_code: 0,
+    stdout: JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny' } }) });
+  assert.equal(evaluate(stdoutDeny).verdict, 'NOT_PROVEN');
+});
+
+test('native denial without a correlated error tool result is not proof', () => {
+  const value = fixture();
+  value.messages[1].message.content = value.messages[1].message.content.filter(result => result.tool_use_id !== 'call-1');
+  const proof = evaluate(value);
+  assert.equal(proof.verdict, 'NOT_PROVEN');
+  assert.equal(proof.cases[1].outcome, 'NOT_PROVEN');
 });
 
 test('guard audit remains exact-only when native hook input expands a planned alias', () => {
@@ -263,6 +301,8 @@ test('audit failure cannot suppress observed exposure and new alias controls mus
   const exposure = fixture(); exposure.guard_events = null;
   exposure.messages[1].message.content.push({ type: 'tool_result', tool_use_id: 'call-1', content: exposure.manifest.denied_value });
   assert.equal(evaluate(exposure).verdict, 'READ_ISOLATION_FAIL');
+  const malformed = [...exposure.messages, { type: 'assistant', message: 'malformed' }];
+  assert.equal(integration(malformed, false, null).proof.verdict, 'READ_ISOLATION_FAIL');
   for (const id of ['call-15', 'call-16']) {
     const value = fixture();
     value.messages[1].message.content = value.messages[1].message.content.filter(result => result.tool_use_id !== id);
@@ -378,7 +418,7 @@ test('native mismatch diagnostics are bounded flags, never raw input, and never 
       id_denials: 1, tool_name_match: true, input_keys_match: true, input_types_match: true,
       exact_input_match: false, call_has_tilde: id === 'Read-home', call_has_dotdot: id === 'Read-normalized',
       denial_has_tilde: false, denial_has_dotdot: false, denial_is_expansion_of_call: true,
-      result_count: 0, result_error_count: 0,
+      result_count: 1, result_error_count: 1,
     });
   }
   assert.doesNotMatch(JSON.stringify(result), /\/fake\/|denied\.txt|\.\.\//);
