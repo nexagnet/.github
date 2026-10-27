@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const { readFileSync, existsSync } = require('node:fs');
 const { resolve } = require('node:path');
 const { spawnSync } = require('node:child_process');
+const { createHash } = require('node:crypto');
 
 const workflowPath = resolve(__dirname, '../.github/workflows/claude-read-isolation-probe.yml');
 const python = process.env.NEXAGNET_TEST_PYTHON || (process.platform === 'win32'
@@ -23,6 +24,10 @@ function fixture() {
       id: `${tool}-${alias}`, tool, kind: 'denied', input: { path: `/fake/.aws/${alias}/denied.txt` },
     })),
   ]);
+  cases.push(
+    { id: 'Read-control-home', tool: 'Read', kind: 'control', input: { file_path: '~/public/control-home.txt' } },
+    { id: 'Read-control-normalized', tool: 'Read', kind: 'control', input: { file_path: '/fake/public/step/../control-normalized.txt' } },
+  );
   const manifest = { cases, control_value: 'SYNTHETIC_CONTROL', denied_value: 'SYNTHETIC_DENIED' };
   const calls = cases.map((item, i) => ({ type: 'tool_use', id: `call-${i}`, name: item.tool, input: item.input }));
   const results = cases.filter(item => item.kind === 'control').map(item => ({
@@ -32,7 +37,12 @@ function fixture() {
   const denials = cases.filter(item => item.kind === 'denied').map(item => ({
     tool_name: item.tool, tool_use_id: calls[cases.indexOf(item)].id, tool_input: item.input,
   }));
-  return { manifest, messages: [
+  const guard_events = calls.map((call, index) => ({
+    schema: 'read-guard-audit-v1', id_sha256: createHash('sha256').update(call.id).digest('hex'),
+    tool: call.name, decision: 'neutral', case_index: index, expanded_case_index: index,
+    has_tilde: false, has_dotdot: false,
+  }));
+  return { manifest, guard_events, messages: [
     { type: 'assistant', message: { content: calls } },
     { type: 'user', message: { content: results } },
     { type: 'result', subtype: 'success', is_error: false, permission_denials: denials },
@@ -59,7 +69,35 @@ function guard(manifest, value) {
   return JSON.parse(run.stdout);
 }
 
-function integration(messages, invalidExecution = false) {
+function guardProcesses(manifest, events, brokenAudit = false) {
+  const block = source().split('          # READ_GUARD_PY_BEGIN\n')[1]?.split('          # READ_GUARD_PY_END')[0];
+  const code = block.split('\n').map(line => line.startsWith('          ') ? line.slice(10) : line).join('\n');
+  const script = `import base64,json,sys,tempfile,pathlib,os,subprocess,concurrent.futures
+p=json.load(sys.stdin)
+with tempfile.TemporaryDirectory() as folder:
+ private=pathlib.Path(folder)/'read-probe/private'; private.mkdir(parents=True)
+ (private/'manifest.json').write_text(json.dumps(p['manifest']))
+ audit=private/'guard-audit.jsonl'
+ if p['broken']: audit.mkdir()
+ else: audit.touch(mode=0o600)
+ guard=private/'guard.py'; guard.write_bytes(base64.b64decode(sys.argv[1]))
+ env=dict(os.environ,RUNNER_TEMP=folder)
+ def invoke(event):
+  run=subprocess.run([sys.executable,str(guard)],input=json.dumps(event),capture_output=True,text=True,env=env)
+  if run.returncode: raise RuntimeError('guard process failed')
+  return json.loads(run.stdout)
+ with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool: decisions=list(pool.map(invoke,p['events']))
+ records=[json.loads(line) for line in audit.read_text().splitlines()] if audit.is_file() else []
+ print(json.dumps({'decisions':decisions,'records':records,'mode':audit.stat().st_mode & 0o777}))
+`;
+  const run = spawnSync(python, ['-c', script, Buffer.from(code).toString('base64')], {
+    input: JSON.stringify({ manifest, events, broken: brokenAudit }), encoding: 'utf8',
+  });
+  assert.equal(run.status, 0, run.stderr.slice(0, 500));
+  return JSON.parse(run.stdout);
+}
+
+function integration(messages, invalidExecution = false, auditEvents = fixture().guard_events) {
   const script = `import base64,json,sys,tempfile,pathlib,os
 from unittest.mock import patch
 from types import SimpleNamespace
@@ -71,9 +109,13 @@ with tempfile.TemporaryDirectory() as folder:
  private.mkdir(parents=True); (home/'public').mkdir(parents=True)
  manifest=p['manifest']; manifest['home']=str(home)
  (home/'public/control.txt').write_text(manifest['control_value'])
+ (home/'public/step').mkdir()
+ for alias in ['control-home.txt','control-normalized.txt']: (home/'public'/alias).write_text(manifest['control_value'])
  for alias in ['home','absolute','symlink','normalized']:
   target=home/'.aws'/alias; target.mkdir(parents=True); (target/'denied.txt').write_text(manifest['denied_value'])
  (private/'manifest.json').write_text(json.dumps(manifest))
+ if p['audit'] is not None:
+  (private/'guard-audit.jsonl').write_text(''.join(json.dumps(event)+'\\n' for event in p['audit']))
  execution=root/'claude-execution-output.json'; execution.write_text('invalid-json' if p['invalid'] else json.dumps(p['messages']))
  env={'RUNNER_TEMP':folder,'EXECUTION_FILE':str(execution),'ACTION_OUTCOME':'success','GITHUB_SHA':'a'*40,'GITHUB_RUN_ID':'123','GITHUB_STEP_SUMMARY':str(root/'summary')}
  original_resolve=pathlib.Path.resolve
@@ -86,7 +128,7 @@ with tempfile.TemporaryDirectory() as folder:
 `;
   const value = fixture();
   const run = spawnSync(python, ['-c', script, Buffer.from(verifier()).toString('base64')],
-    { input: JSON.stringify({ manifest: value.manifest, messages, invalid: invalidExecution }), encoding: 'utf8' });
+    { input: JSON.stringify({ manifest: value.manifest, messages, invalid: invalidExecution, audit: auditEvents }), encoding: 'utf8' });
   assert.equal(run.status, 0, run.stderr.slice(0, 500));
   return JSON.parse(run.stdout.split('TEST_PROOF=')[1]);
 }
@@ -121,7 +163,7 @@ test('main rejects malformed or wrong-role tool evidence with safe diagnostics',
 
 test('safety guard is neutral for every exact planned pair and denies other tool inputs', () => {
   const { manifest } = fixture();
-  const event = item => ({ hook_event_name: 'PreToolUse', tool_name: item.tool, tool_input: item.input });
+  const event = item => ({ hook_event_name: 'PreToolUse', tool_name: item.tool, tool_input: item.input, tool_use_id: 'guard-test-call' });
   for (const item of manifest.cases) assert.deepEqual(guard(manifest, event(item)), {});
   const valid = event(manifest.cases[0]);
   for (const value of [null, {}, { ...valid, hook_event_name: 'PostToolUse' },
@@ -151,10 +193,83 @@ test('Read diagnostic is owner/repository/ref/SHA gated with explicit read-only 
   assert.doesNotMatch(text, /path:.*claude-execution-output/);
 });
 
-test('all three controls and twelve authoritative native denials prove the scoped matrix', () => {
+test('all five controls, neutral guard audit and twelve native denials prove the scoped matrix', () => {
   const result = evaluate(fixture());
   assert.equal(result.verdict, 'READ_ISOLATION_PROVEN');
-  assert.equal(result.cases.length, 15);
+  assert.equal(result.schema, 'nexagnet-read-isolation-v2');
+  assert.equal(result.cases.length, 17);
+  assert.ok(result.cases.every(item => item.guard_diag.guard_neutral));
+});
+
+test('actual concurrent guard processes append bounded private evidence before neutral decisions', () => {
+  const { manifest } = fixture();
+  const events = manifest.cases.map((item, i) => ({ hook_event_name: 'PreToolUse',
+    tool_name: item.tool, tool_input: item.input, tool_use_id: `guard-${i}` }));
+  const result = guardProcesses(manifest, events);
+  assert.equal(result.records.length, 17);
+  assert.ok(result.decisions.every(decision => Object.keys(decision).length === 0));
+  assert.equal(new Set(result.records.map(record => record.id_sha256)).size, 17);
+  for (const record of result.records) {
+    assert.match(record.id_sha256, /^[0-9a-f]{64}$/);
+    assert.equal(record.decision, 'neutral');
+    assert.equal(typeof record.has_tilde, 'boolean');
+    assert.ok(Number.isInteger(record.case_index) && record.case_index >= 0 && record.case_index < 17);
+  }
+  if (process.platform !== 'win32') assert.equal(result.mode, 0o600);
+  assert.doesNotMatch(JSON.stringify(result.records), /file_path|tool_input|\/fake\/|guard-0/);
+  const broken = guardProcesses(manifest, [events[0]], true);
+  assert.equal(broken.decisions[0].hookSpecificOutput.permissionDecision, 'deny');
+  const invalid = guardProcesses(manifest, [{ ...events[0], tool_use_id: null }]);
+  assert.equal(invalid.decisions[0].hookSpecificOutput.permissionDecision, 'deny');
+});
+
+test('guard audit remains exact-only when native hook input expands a planned alias', () => {
+  const value = fixture();
+  value.manifest.home = '/fake';
+  const result = guardProcesses(value.manifest, [{ hook_event_name: 'PreToolUse', tool_name: 'Read',
+    tool_use_id: 'expanded-hook', tool_input: { file_path: '/fake/public/control-home.txt' } }]);
+  assert.equal(result.decisions[0].hookSpecificOutput.permissionDecision, 'deny');
+  assert.equal(result.records[0].decision, 'deny');
+  assert.equal(result.records[0].case_index, -1);
+  assert.equal(result.records[0].expanded_case_index, 15);
+});
+
+test('missing duplicate malformed unknown or cross-case guard audits never establish native proof', () => {
+  for (const mutate of [
+    value => { value.guard_events = null; },
+    value => { value.guard_events = []; },
+    value => { value.guard_events.push({ ...value.guard_events[1] }); },
+    value => { value.guard_events[1].decision = 'deny'; },
+    value => { value.guard_events[1].case_index = 2; },
+    value => { value.guard_events[1].tool = 'Glob'; },
+    value => { value.guard_events[1].unexpected_raw_input = '/private'; },
+    value => { value.guard_events[1].id_sha256 = 'f'.repeat(64); },
+    value => { value.guard_events[1].case_index = true; },
+  ]) {
+    const value = fixture(); mutate(value);
+    const result = evaluate(value);
+    assert.equal(result.verdict, 'NOT_PROVEN');
+    const item = result.cases.find(item => item.id === 'Read-home');
+    assert.equal(item.native_denial, false);
+    assert.equal(item.outcome, 'NOT_PROVEN');
+    assert.equal(item.guard_diag.guard_neutral, false);
+  }
+  const value = fixture();
+  assert.equal(integration(value.messages, false, null).proof.verdict, 'NOT_PROVEN');
+  assert.equal(integration(value.messages, false, [{ malformed: true }]).proof.verdict, 'NOT_PROVEN');
+});
+
+test('audit failure cannot suppress observed exposure and new alias controls must actually succeed', () => {
+  const exposure = fixture(); exposure.guard_events = null;
+  exposure.messages[1].message.content.push({ type: 'tool_result', tool_use_id: 'call-1', content: exposure.manifest.denied_value });
+  assert.equal(evaluate(exposure).verdict, 'READ_ISOLATION_FAIL');
+  for (const id of ['call-15', 'call-16']) {
+    const value = fixture();
+    value.messages[1].message.content = value.messages[1].message.content.filter(result => result.tool_use_id !== id);
+    assert.equal(evaluate(value).verdict, 'NOT_PROVEN');
+  }
+  const proof = evaluate(fixture());
+  assert.doesNotMatch(JSON.stringify(proof), /id_sha256|call-0|\/fake\//);
 });
 
 test('missing null empty and non-string native identities cannot prove isolation', () => {
