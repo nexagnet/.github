@@ -58,6 +58,8 @@ jobs:
             if [ "$status" -ne 0 ]; then
               printf '::error::REVIEWER_GATE_BLOCKED: %s. %s\n' "$reason" "$recovery"
               if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+                # Backticks are literal Markdown formatting, not shell substitution.
+                # shellcheck disable=SC2016
                 printf '### Reviewer gate blocked\n\nReason: `%s`\n\n%s\n\nAI review did not run. No review verdict was produced.\n' \
                   "$reason" "$recovery" >> "$GITHUB_STEP_SUMMARY" || true
               fi
