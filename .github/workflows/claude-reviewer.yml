@@ -286,6 +286,67 @@ jobs:
             --disallowedTools "Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch"
             --json-schema '{"type":"object","additionalProperties":false,"required":["head_sha","verdict","summary","findings","diff_inspected"],"properties":{"diff_inspected":{"type":"boolean"},"head_sha":{"type":"string"},"verdict":{"enum":["PASS","REQUEST_CHANGES"]},"summary":{"type":"string","maxLength":2000},"findings":{"type":"array","maxItems":12,"items":{"type":"object","additionalProperties":false,"required":["severity","path","line","message"],"properties":{"severity":{"enum":["blocker","major","minor","nit"]},"path":{"type":"string"},"line":{"type":"integer","minimum":1},"message":{"type":"string","maxLength":2000}}}}}}'
 
+      - name: Diagnose failed Claude SDK execution
+        if: failure() && steps.claude.outcome == 'failure'
+        shell: node {0}
+        env:
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+        run: |
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const unavailable = 'SDK_DIAGNOSTIC_UNAVAILABLE';
+          function diagnose() {
+            let fd;
+            try {
+              const canonical = path.join(process.env.RUNNER_TEMP, 'claude-execution-output.json');
+              if (process.env.EXECUTION_FILE && process.env.EXECUTION_FILE !== canonical) return unavailable;
+              const before = fs.lstatSync(canonical);
+              const limit = 5 * 1024 * 1024;
+              if (!before.isFile() || before.isSymbolicLink() || before.size > limit) return unavailable;
+              fd = fs.openSync(canonical, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+              const opened = fs.fstatSync(fd);
+              if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino || opened.size > limit) return unavailable;
+              const buffer = Buffer.alloc(limit + 1);
+              const size = fs.readSync(fd, buffer, 0, buffer.length, 0);
+              if (size > limit) return unavailable;
+              const messages = JSON.parse(buffer.subarray(0, size).toString('utf8'));
+              if (!Array.isArray(messages)) return unavailable;
+              const results = messages.filter(item => item?.type === 'result');
+              if (results.length !== 1 || messages.at(-1) !== results[0]) return unavailable;
+              const result = results[0];
+              const failed = result.is_error === true || /^error(?:_|$)/.test(result.subtype);
+              if (!failed) {
+                return result.subtype === 'success' && result.is_error === false && !Object.hasOwn(result, 'structured_output')
+                  ? 'SDK_OUTPUT_MISSING' : unavailable;
+              }
+              // Only error-bearing terminal strings and exact SDK error enums are hints.
+              // Prompt, assistant content, tool output and structured review data stay unread.
+              const text = [typeof result.result === 'string' ? result.result : '',
+                ...(Array.isArray(result.errors) ? result.errors.filter(item => typeof item === 'string') : [])].join('\n');
+              const enums = messages.filter(item => item?.type === 'assistant').map(item => item.error);
+              if (enums.includes('authentication_failed') || /\b(authentication[_ ](?:failed|error)|invalid[_ ]api[_ ]key|oauth|unauthorized|token expired)\b/i.test(text)) return 'SDK_AUTH_ERROR_HINT';
+              if (enums.includes('rate_limit') || /\b(rate[_ -]?limit|too many requests|usage limit|you(?:'ve| have) hit your limit|credit balance (?:is )?too low|insufficient credits)\b/i.test(text)) return 'SDK_RATE_LIMIT_HINT';
+              if (/\b(model[_ ]not[_ ]found|unsupported model|invalid model)\b|\bmodel\b[^\n]{0,120}\b(not found|not available|unsupported|does not exist)\b/i.test(text)) return 'SDK_MODEL_ERROR_HINT';
+              return 'SDK_ERROR_UNKNOWN';
+            } catch { return unavailable; }
+            finally { if (fd !== undefined) { try { fs.closeSync(fd); } catch {} } }
+          }
+          const code = diagnose();
+          const recovery = {
+            SDK_AUTH_ERROR_HINT: 'Check the configured Claude authentication through the approved owner process.',
+            SDK_RATE_LIMIT_HINT: 'Check provider capacity or limits before an explicitly authorized retry.',
+            SDK_MODEL_ERROR_HINT: 'Check provider model availability and the reviewed Action configuration.',
+            SDK_ERROR_UNKNOWN: 'SDK error metadata did not identify a supported diagnostic hint.',
+            SDK_OUTPUT_MISSING: 'The terminal SDK result lacks structured review output.',
+            SDK_DIAGNOSTIC_UNAVAILABLE: 'Bounded SDK metadata could not establish a diagnostic hint.'
+          }[code];
+          const message = `REVIEWER_SDK_DIAGNOSTIC: ${code}. ${recovery} Advisory only; the Action remains failed and no review verdict is produced.`;
+          console.log(`::notice::${message}`);
+          try {
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY,
+              `### Reviewer SDK diagnostic\n\nCode: \`${code}\`\n\n${recovery}\n\nAdvisory only. The Action remains failed; this is not a review verdict or proof of provider cause.\n`);
+          } catch {}
+
   report:
     needs: [gate, review]
     if: needs.review.result == 'success'

@@ -86,6 +86,46 @@ deployed consumer. This change needs exact-head central CI and independent revie
 owner-controlled central merge, exact-main CI, a separate consumer SHA-pin PR and
 an approved live synthetic PR before claiming rollout/runtime completion.
 
+## Bounded SDK failure diagnostics (#47)
+
+The pinned official Action writes SDK messages to a runner-local JSON array before
+checking structured output. Its safe log summary can show `subtype: success` with
+`is_error: true`, followed by a missing `structured_output` error. This is an Action
+failure, not a completed review. The result subtype or zero cost alone does not
+identify an authentication, quota or model problem. See the pinned
+[execution-file writer](https://github.com/anthropics/claude-code-action/blob/6fed3ca145920b639991cb756090506e1bcaf515/base-action/src/execution-file.ts)
+and [SDK result handling](https://github.com/anthropics/claude-code-action/blob/6fed3ca145920b639991cb756090506e1bcaf515/base-action/src/run-claude-sdk.ts).
+
+A trusted failure-only inline step reads the bounded canonical runner-temp file.
+It rejects unsafe paths, symlinks, nonregular files, malformed JSON and ambiguous
+terminal results. It examines only error-bearing terminal fields and explicit
+assistant error enums. Prompt text, source files and tool results are not searched
+for error keywords. Raw strings, paths, transcripts and exceptions are never
+printed or uploaded.
+
+| Diagnostic | Meaning and next step |
+|---|---|
+| `SDK_AUTH_ERROR_HINT` | Error fields suggest an authentication problem; owner investigates the approved credential path. Do not print or replace secrets automatically. |
+| `SDK_RATE_LIMIT_HINT` | Error fields suggest usage/rate limits; check the account/provider status before another attempt. |
+| `SDK_MODEL_ERROR_HINT` | Error fields suggest a model availability problem; investigate the pinned configuration without silently switching models. |
+| `SDK_ERROR_UNKNOWN` | SDK reported an error without a recognized category; retain failure and report the limited evidence. |
+| `SDK_OUTPUT_MISSING` | A nonerror terminal result lacks required structured output; inspect the Action/schema contract. |
+| `SDK_DIAGNOSTIC_UNAVAILABLE` | No safe, bounded diagnostic input is available; do not enable raw output to chase it. |
+
+These are advisory hints derived from untrusted SDK fields, not authoritative
+provider diagnoses. They never permit a retry, credential operation, verdict,
+Reporter execution or merge. The failed Claude step remains failed; Reporter
+still requires successful review and its independent revalidation. Keep
+`show_full_output: false` and Actions step debugging disabled, because the pinned
+Action enables full output when Actions debugging is enabled.
+
+Reruns must retain an open PR and the authorized current SHA, valid Task Contract
+and successful exact-head CI. After a consumer pin changes, re-run source CI to
+create a fresh Reviewer workflow_run using the current default-branch caller;
+rerunning the old Reviewer run retains its original workflow context. Record run
+ID, attempt and job IDs. A diagnostic is not runtime review proof: proof still
+requires actual diff inspection and same-SHA trusted verdict/artifact.
+
 ## R3 merge, rollout and rollback
 
 1. Independent review and required CI on the exact central PR HEAD.
