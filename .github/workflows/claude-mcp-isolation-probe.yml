@@ -107,6 +107,124 @@ jobs:
               write_json(plugin / ".claude-plugin/plugin.json", {"name":"nexagnetprobe", "version":"1.0.0"})
               write_json(plugin / ".mcp.json", {"mcpServers":{"plugin_canary":entry("plugin")}})
 
+          # EXECUTION_DIAG_PY_BEGIN
+          def execution_diagnostics(messages=()):
+              diag = {'execution_state': 'NOT_EXECUTED', 'diagnostics_valid': True,
+                      'final_count': 0, 'final_subtype': 'NONE', 'final_is_error': 'UNKNOWN', 'api_error_status': 'UNKNOWN',
+                      'error_entry_count': 0, 'assistant_error_count': 0, 'signals': []}
+              if type(messages) is tuple and not messages:
+                  return diag
+              diag['execution_state'] = 'OBSERVED'
+              if not isinstance(messages, list) or len(messages) > 500:
+                  return {**diag, 'execution_state': 'INVALID', 'diagnostics_valid': False}
+              codes = {'authentication_failed', 'oauth_org_not_allowed', 'account_on_hold', 'billing_error',
+                       'rate_limit', 'overloaded', 'invalid_request', 'model_not_found', 'server_error',
+                       'max_output_tokens', 'cloud_credential_error', 'unknown'}
+              subtypes = {'success', 'error_during_execution', 'error_max_turns', 'error_max_budget_usd',
+                          'error_max_structured_output_retries'}
+              signatures = {'AUTHENTICATION_SIGNATURE': ('oauth token has expired', 'invalid api key',
+                                                         'invalid authentication credentials'),
+                            'BILLING_SIGNATURE': ('credit balance is too low',),
+                            'RATE_LIMIT_SIGNATURE': ('rate limit exceeded',),
+                            'MODEL_SIGNATURE': ('model not found',)}
+              finals, signals = [], set()
+              for message in messages:
+                  if not isinstance(message, dict):
+                      diag['diagnostics_valid'] = False
+                      continue
+                  if message.get('type') == 'result':
+                      finals.append(message)
+                  if message.get('type') == 'assistant' and 'error' in message:
+                      diag['assistant_error_count'] = min(9, diag['assistant_error_count'] + 1)
+                      code = message['error']
+                      if not isinstance(code, str) or len(code) > 64:
+                          diag['diagnostics_valid'] = False
+                          signals.add('SDK_UNKNOWN')
+                      else:
+                          signals.add('SDK_' + (code if code in codes else 'unknown').upper())
+              diag['final_count'] = min(9, len(finals))
+              if len(finals) > 1:
+                  diag.update({'final_subtype': 'AMBIGUOUS', 'diagnostics_valid': False})
+              elif len(finals) == 1:
+                  final = finals[0]
+                  status = final.get('api_error_status')
+                  if status is None:
+                      diag['api_error_status'] = 'NONE'
+                  elif type(status) is int:
+                      diag['api_error_status'] = str(status) if status in {400, 401, 403, 404, 408, 413, 429, 500, 502, 503, 504, 529} else 'OTHER'
+                  else:
+                      diag['diagnostics_valid'] = False
+                  subtype, is_error = final.get('subtype'), final.get('is_error')
+                  diag['final_subtype'] = subtype if isinstance(subtype, str) and subtype in subtypes else 'OTHER'
+                  diag['final_is_error'] = ('TRUE' if is_error else 'FALSE') if type(is_error) is bool else 'UNKNOWN'
+                  if diag['final_subtype'] == 'OTHER' or type(is_error) is not bool:
+                      diag['diagnostics_valid'] = False
+                  errors = final.get('errors', [])
+                  if not isinstance(errors, list):
+                      diag['diagnostics_valid'] = False
+                      errors = []
+                  diag['error_entry_count'] = min(9, len(errors))
+                  if len(errors) > 9:
+                      diag['diagnostics_valid'] = False
+                  if is_error is True or (isinstance(subtype, str) and subtype.startswith('error_')):
+                      texts = errors[:9] + ([final['result']] if 'result' in final else [])
+                      for text in texts:
+                          if not isinstance(text, str) or len(text) > 4096:
+                              diag['diagnostics_valid'] = False
+                              continue
+                          lowered = text.lower()
+                          signals.update(signal for signal, phrases in signatures.items()
+                                         if any(phrase in lowered for phrase in phrases))
+              if len(signals) > 8:
+                  diag['diagnostics_valid'] = False
+              diag['signals'] = sorted(signals)[:8]
+              return diag
+          def public_execution_diagnostics(value):
+              fallback = {**execution_diagnostics(), 'execution_state': 'INVALID', 'diagnostics_valid': False}
+              signals = {'SDK_' + code.upper() for code in ('authentication_failed oauth_org_not_allowed account_on_hold '
+                         'billing_error rate_limit overloaded invalid_request model_not_found server_error '
+                         'max_output_tokens cloud_credential_error unknown').split()}
+              signals.update({'AUTHENTICATION_SIGNATURE', 'BILLING_SIGNATURE', 'RATE_LIMIT_SIGNATURE', 'MODEL_SIGNATURE'})
+              subtypes = {'NONE', 'OTHER', 'AMBIGUOUS', 'success', 'error_during_execution', 'error_max_turns',
+                          'error_max_budget_usd', 'error_max_structured_output_retries'}
+              if not isinstance(value, dict) or set(value) != set(fallback):
+                  return fallback
+              if (any(not isinstance(value[key], str) for key in ('execution_state', 'final_subtype', 'final_is_error', 'api_error_status'))
+                      or value['execution_state'] not in {'NOT_EXECUTED', 'OBSERVED', 'INVALID'}
+                      or value['final_subtype'] not in subtypes or value['final_is_error'] not in {'TRUE', 'FALSE', 'UNKNOWN'}
+                      or value['api_error_status'] not in {'NONE', 'OTHER', 'UNKNOWN', '400', '401', '403', '404', '408', '413', '429', '500', '502', '503', '504', '529'}
+                      or type(value['diagnostics_valid']) is not bool
+                      or any(type(value[key]) is not int or not 0 <= value[key] <= 9
+                             for key in ('final_count', 'error_entry_count', 'assistant_error_count'))
+                      or not isinstance(value['signals'], list) or len(value['signals']) > 8
+                      or any(not isinstance(signal, str) or signal not in signals for signal in value['signals'])):
+                  return fallback
+              return value
+
+          def load_execution_diagnostics(path):
+              import stat
+              invalid = public_execution_diagnostics(None)
+              try:
+                  if path.is_symlink():
+                      return invalid
+                  descriptor = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+                  try:
+                      info = os.fstat(descriptor)
+                      if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 4096:
+                          return invalid
+                      raw = os.read(descriptor, 4097)
+                  finally:
+                      os.close(descriptor)
+                  if len(raw) > 4096:
+                      return invalid
+                  return public_execution_diagnostics(json.loads(raw.decode('utf-8')))
+              except FileNotFoundError:
+                  return execution_diagnostics()
+              except (OSError, ValueError, UnicodeError):
+                  return invalid
+
+          # EXECUTION_DIAG_PY_END
+
           def content_text(value):
               if isinstance(value, str):
                   return value
@@ -235,12 +353,15 @@ jobs:
           def summarize(phase):
               path = pathlib.Path(os.environ.get("EXECUTION_FILE", "/nonexistent"))
               messages = []
+              execution_diag = execution_diagnostics()
               try:
                   if path.is_file() and path.stat().st_size <= 2097152:
                       messages = json.loads(path.read_text(encoding="utf-8"))
+                      execution_diag = execution_diagnostics(messages)
                   report = summarize_messages(messages, os.environ.get("ACTION_OUTCOME") == "success", actual_cli_version(phase))
               except (ValueError, TypeError, KeyError, AttributeError):
                   report = {"action_success":False, "read_ok":False, "unexpected_tool":True, "init_count":0}
+              write_json(ROOT / "private" / (phase + "-diag.json"), execution_diag)
               write_json(ROOT / "private" / (phase + "-report.json"), report)
               if phase == "control":
                   events = load_events("control") or []
@@ -254,6 +375,7 @@ jobs:
                   return json.loads(path.read_text(encoding="utf-8")) if path.exists() else default
               result = assess({"control":read("control-report.json", {}), "candidate":read("candidate-report.json", {}),
                   "control_events":load_events("control"), "candidate_events":load_events("candidate"), "control_stopped":read("stopped.json", False)})
+              result["execution_diag"] = {phase:load_execution_diagnostics(ROOT / "private" / (phase + "-diag.json")) for phase in ("control", "candidate")}
               write_json(ROOT / "private/audit.json", result)
               print("MCP_PROBE_VERDICT=" + result["verdict"])
               print("CONTROL_SOURCES=" + str(result["control_source_count"]))

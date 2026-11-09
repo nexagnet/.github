@@ -52,10 +52,9 @@ function fixture() {
 }
 function evaluate(value) {
   assert.ok(existsSync(python) || process.platform !== 'win32', 'Python test runtime unavailable');
-  const code = Buffer.from(verifier()).toString('base64');
   const run = spawnSync(python, ['-c',
-    'import base64,json,sys; scope={"__name__":"probe_test"}; exec(base64.b64decode(sys.argv[1]),scope); p=json.load(sys.stdin); print(json.dumps(scope["evaluate"](**p)))', code],
-  { input: JSON.stringify(value), encoding: 'utf8' });
+    'import json,sys; p=json.load(sys.stdin); scope={"__name__":"probe_test"}; exec(p.pop("verifier_source"),scope); print(json.dumps(scope["evaluate"](**p)))'],
+  { input: JSON.stringify({ ...value, verifier_source: verifier() }), encoding: 'utf8' });
   assert.equal(run.status, 0, run.stderr.slice(0, 500));
   return JSON.parse(run.stdout);
 }
@@ -63,8 +62,8 @@ function evaluate(value) {
 function executionDiagnostics(messages, absent = false) {
   const code = Buffer.from(verifier()).toString('base64');
   const run = spawnSync(python, ['-c',
-    'import base64,json,sys; scope={"__name__":"probe_test"}; exec(base64.b64decode(sys.argv[1]),scope); value=json.load(sys.stdin); print(json.dumps(scope["execution_diagnostics"]() if value["absent"] else scope["execution_diagnostics"](value["messages"])))', code],
-  { input: JSON.stringify({ messages, absent }), encoding: 'utf8' });
+    'import json,sys; value=json.load(sys.stdin); scope={"__name__":"probe_test"}; exec(value.pop("verifier_source"),scope); print(json.dumps(scope["execution_diagnostics"]() if value["absent"] else scope["execution_diagnostics"](value["messages"])))'],
+  { input: JSON.stringify({ messages, absent, verifier_source: verifier() }), encoding: 'utf8' });
   assert.equal(run.status, 0, run.stderr.slice(0, 500));
   return JSON.parse(run.stdout);
 }
@@ -201,8 +200,8 @@ function integration(messages, invalidExecution = false, auditEvents = fixture()
 from unittest.mock import patch
 from types import SimpleNamespace
 scope={"__name__":"probe_test"}
-exec(base64.b64decode(sys.argv[1]),scope)
 p=json.load(sys.stdin)
+exec(p.pop('verifier_source'),scope)
 with tempfile.TemporaryDirectory() as folder:
  root=pathlib.Path(folder); base=root/'read-probe'; home=base/'home'; private=base/'private'
  private.mkdir(parents=True); (home/'public').mkdir(parents=True)
@@ -227,8 +226,8 @@ with tempfile.TemporaryDirectory() as folder:
  proof=json.loads((base/'proof.json').read_text()); print('TEST_PROOF='+json.dumps({'proof':proof,'status':status}))
 `;
   const value = fixture();
-  const run = spawnSync(python, ['-c', script, Buffer.from(verifier()).toString('base64')],
-    { input: JSON.stringify({ manifest: value.manifest, messages, invalid: invalidExecution, audit: auditEvents }), encoding: 'utf8' });
+  const run = spawnSync(python, ['-c', script],
+    { input: JSON.stringify({ manifest: value.manifest, messages, invalid: invalidExecution, audit: auditEvents, verifier_source: verifier() }), encoding: 'utf8' });
   assert.equal(run.status, 0, run.stderr.slice(0, 500));
   return JSON.parse(run.stdout.split('TEST_PROOF=')[1]);
 }

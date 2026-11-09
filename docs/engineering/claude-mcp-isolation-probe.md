@@ -62,6 +62,24 @@ audit records both versions. Any missing version or mismatch from `2.1.293` yiel
 Runtime acceptance needs exact central/consumer SHAs, run ID, installed CLI version,
 sanitized artifact/hash, all control outcomes and independent evidence review.
 
+The top-level `execution_diag` adds separate observational control/candidate
+diagnostics after the existing assessment. Each phase uses the same bounded SDK
+reducer as the Read probe: fixed enums/booleans, counts capped at nine and at most
+eight fixed signals. Only typed `assistant.error` and a unique failed final result
+or errors are inspected, with at most nine error entries and 4,096 characters per
+text. No ordinary model/tool prose, paths or free-form error text is exported.
+Unknown or malformed evidence stays unknown; a literal signature is not a verified
+root cause. A skipped candidate is `NOT_EXECUTED`, never successful execution or
+startup suppression. Private phase diagnostics are validated again before public
+export. Diagnostics do not participate in `assess` or change acceptance; see the
+[official SDK error types](https://code.claude.com/docs/en/agent-sdk/typescript#sdkassistantmessage).
+Optional final `api_error_status` values are reduced to fixed HTTP status enums.
+Missing/null is `NONE`; unrecognized integers are `OTHER`; malformed or ambiguous
+values stay `UNKNOWN`. Diagnostic sidecars are limited to 4,096 bytes and read
+without following symlinks. Missing files are `NOT_EXECUTED`; invalid JSON, invalid
+shape, non-regular files and read failures yield `INVALID` without suppressing an
+existing assessment failure or printing raw errors.
+
 This establishes only observed startup behavior for these four source fixtures,
 the tested plugin-dir stress case and pinned runtime. It does not establish MCP
 tool authorization, external network/credential isolation, Figma authorization,

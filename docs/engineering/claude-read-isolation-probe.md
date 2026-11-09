@@ -107,6 +107,21 @@ messages, paths or transcript data. SDK system/progress messages are excluded
 from tool-content parsing; assistant/user evidence still follows the strict
 case, response and native denial requirements above.
 
+The observational `execution_diag` reports fixed SDK subtype/error enums and
+counts capped at nine, plus at most eight fixed signal enums. Only typed
+`assistant.error` and a unique failed final result/errors are inspected; ordinary
+model/tool prose is never classified. Error text is limited to 4,096 characters
+per entry and nine entries. It is reduced to narrow literal signature flags and
+never published. Unknown, duplicate, malformed or oversized evidence cannot supply
+a cause; signature flags are observations rather than verified root causes.
+The unique final result's optional `api_error_status` is reduced to fixed HTTP
+status enums; missing/null is `NONE`, other integers are `OTHER`, and malformed or
+ambiguous values are `UNKNOWN`. No arbitrary value is exported.
+The reducer follows the [official SDK error types](https://code.claude.com/docs/en/agent-sdk/typescript#sdkassistantmessage).
+Diagnostics attach after the existing verdict, including exposure failures, and
+cannot grant native proof. `NOT_EXECUTED` means no execution was parsed, while an
+empty observed stream proves neither hook execution nor useful model execution.
+
 Record caller and central SHA, Action/CLI version, run URL, sanitized artifact
 ID/digest, verifier verdict and independent review on canonical #36. Preserve
 per-tool and per-alias gaps rather than collapsing them into a security PASS.
