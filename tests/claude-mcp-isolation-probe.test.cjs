@@ -41,6 +41,36 @@ function validInput() {
   };
 }
 
+test('Read and MCP embed the same bounded observational SDK diagnostic reducer', () => {
+  const read = fs.readFileSync(path.join(__dirname, '../.github/workflows/claude-read-isolation-probe.yml'), 'utf8').replaceAll('\r\n', '\n');
+  const block = text => text.split('          # EXECUTION_DIAG_PY_BEGIN\n')[1]?.split('          # EXECUTION_DIAG_PY_END')[0];
+  assert.ok(block(source));
+  assert.equal(block(source), block(read));
+});
+
+test('actual MCP summarize and verify export bounded phase diagnostics with skipped candidate explicit', () => {
+  withVerifier((script, folder) => {
+    const env = { ...process.env, RUNNER_TEMP: folder, GITHUB_WORKSPACE: path.join(folder, 'workspace'), ACTION_OUTCOME: 'failure' };
+    fs.mkdirSync(env.GITHUB_WORKSPACE);
+    const setup = spawnSync(python, [script, 'setup', 'control'], { env, encoding: 'utf8' });
+    assert.equal(setup.status, 0, setup.stderr);
+    const execution = path.join(folder, 'execution.json');
+    const privateMarker = '/private/never-emit-credential';
+    fs.writeFileSync(execution, JSON.stringify([{ type: 'assistant', error: 'model_not_found' },
+      { type: 'result', subtype: 'success', is_error: true, result: privateMarker }]));
+    const summarize = spawnSync(python, [script, 'summarize', 'control'], { env: { ...env, EXECUTION_FILE: execution }, encoding: 'utf8' });
+    assert.equal(summarize.status, 1);
+    const verified = spawnSync(python, [script, 'verify'], { env, encoding: 'utf8' });
+    assert.equal(verified.status, 1, verified.stderr);
+    const audit = JSON.parse(fs.readFileSync(path.join(folder, 'mcp-isolation/private/audit.json'), 'utf8'));
+    assert.equal(audit.verdict, 'NOT_PROVEN');
+    assert.deepEqual(audit.execution_diag.control.signals, ['SDK_MODEL_NOT_FOUND']);
+    assert.equal(audit.execution_diag.control.final_is_error, 'TRUE');
+    assert.equal(audit.execution_diag.candidate.execution_state, 'NOT_EXECUTED');
+    assert.doesNotMatch(JSON.stringify(audit), /private|never-emit-credential/);
+  });
+});
+
 test('MCP probe is separately owner/ref/SHA gated with read-only explicit credentials', () => {
   assert.match(source, /expected_consumer_sha:/);
   assert.match(source, /test "\$GITHUB_SHA" = "\$EXPECTED_CONSUMER_SHA"/);

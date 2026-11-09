@@ -60,6 +60,82 @@ function evaluate(value) {
   return JSON.parse(run.stdout);
 }
 
+function executionDiagnostics(messages, absent = false) {
+  const code = Buffer.from(verifier()).toString('base64');
+  const run = spawnSync(python, ['-c',
+    'import base64,json,sys; scope={"__name__":"probe_test"}; exec(base64.b64decode(sys.argv[1]),scope); value=json.load(sys.stdin); print(json.dumps(scope["execution_diagnostics"]() if value["absent"] else scope["execution_diagnostics"](value["messages"])))', code],
+  { input: JSON.stringify({ messages, absent }), encoding: 'utf8' });
+  assert.equal(run.status, 0, run.stderr.slice(0, 500));
+  return JSON.parse(run.stdout);
+}
+
+test('execution diagnostics reduce only typed SDK errors and failed final text to fixed bounded values', () => {
+  for (const code of ['authentication_failed', 'oauth_org_not_allowed', 'account_on_hold', 'billing_error',
+    'rate_limit', 'overloaded', 'invalid_request', 'model_not_found', 'server_error', 'max_output_tokens', 'cloud_credential_error', 'unknown']) {
+    const diag = executionDiagnostics([{ type: 'assistant', error: code },
+      { type: 'result', subtype: 'success', is_error: true }]);
+    assert.deepEqual(diag.signals, ['SDK_' + code.toUpperCase()]);
+    assert.equal(diag.final_subtype, 'success');
+    assert.equal(diag.final_is_error, 'TRUE');
+    assert.equal(diag.assistant_error_count, 1);
+    assert.equal(diag.diagnostics_valid, true);
+  }
+  const signatures = [
+    ['OAuth token has expired', 'AUTHENTICATION_SIGNATURE'],
+    ['Credit balance is too low', 'BILLING_SIGNATURE'],
+    ['Rate limit exceeded', 'RATE_LIMIT_SIGNATURE'],
+    ['Model not found', 'MODEL_SIGNATURE'],
+  ];
+  for (const [text, signal] of signatures) {
+    const diag = executionDiagnostics([{ type: 'result', subtype: 'success', is_error: true,
+      result: text + ' /private/home privateMarker-value' }]);
+    assert.deepEqual(diag.signals, [signal]);
+    assert.doesNotMatch(JSON.stringify(diag), /private|privateMarker-value/);
+  }
+});
+
+test('execution diagnostics never classify model/tool prose or echo unknown malformed and oversized data', () => {
+  const privateMarker = '/private/home/credential=never-emit-this';
+  const prose = [{ type: 'assistant', message: { content: [{ type: 'text', text: 'OAuth token has expired ' + privateMarker }] } },
+    { type: 'user', message: { content: [{ type: 'tool_result', content: 'Credit balance is too low ' + privateMarker }] } },
+    { type: 'result', subtype: 'success', is_error: false, result: 'Rate limit exceeded ' + privateMarker }];
+  assert.deepEqual(executionDiagnostics(prose).signals, []);
+  for (const messages of [null, {}, [null], Array(501).fill({}),
+    [{ type: 'assistant', error: { value: privateMarker } }],
+    [{ type: 'result', subtype: privateMarker, is_error: privateMarker, errors: { value: privateMarker } }],
+    [{ type: 'result', subtype: 'success', is_error: true, result: 'x'.repeat(4097) + privateMarker }],
+    [{ type: 'result', subtype: 'success', is_error: true, errors: Array(12).fill(privateMarker) }]]) {
+    const diag = executionDiagnostics(messages);
+    assert.equal(diag.diagnostics_valid, false);
+    assert.doesNotMatch(JSON.stringify(diag), /private|never-emit-this|xxxxx/);
+    for (const key of ['final_count', 'error_entry_count', 'assistant_error_count']) assert.ok(diag[key] <= 9);
+    assert.ok(diag.signals.length <= 8);
+  }
+  const duplicate = executionDiagnostics([{ type: 'result', is_error: true, result: privateMarker },
+    { type: 'result', is_error: true, result: 'OAuth token has expired' }]);
+  assert.equal(duplicate.final_subtype, 'AMBIGUOUS');
+  assert.equal(duplicate.diagnostics_valid, false);
+  assert.deepEqual(duplicate.signals, []);
+  assert.equal(executionDiagnostics([], true).execution_state, 'NOT_EXECUTED');
+});
+
+test('main attaches observational execution diagnostics without weakening native proof or masking exposure', () => {
+  const value = fixture();
+  const proven = integration(value.messages);
+  assert.equal(proven.proof.execution_diag.final_is_error, 'FALSE');
+  assert.equal(proven.proof.verdict, 'READ_ISOLATION_PROVEN');
+  const failed = integration([{ type: 'assistant', error: 'authentication_failed' },
+    { type: 'result', subtype: 'success', is_error: true, result: '/private/do-not-emit' }]);
+  assert.equal(failed.proof.verdict, 'NOT_PROVEN');
+  assert.deepEqual(failed.proof.execution_diag.signals, ['SDK_AUTHENTICATION_FAILED']);
+  assert.doesNotMatch(JSON.stringify(failed.proof), /private|do-not-emit/);
+  const exposed = integration([...value.messages, { type: 'assistant', error: { privateMarker: value.manifest.denied_value } }]);
+  assert.equal(exposed.proof.verdict, 'READ_ISOLATION_FAIL');
+  assert.equal(exposed.proof.execution_diag.diagnostics_valid, false);
+  const invalid = integration([], true);
+  assert.equal(invalid.proof.execution_diag.execution_state, 'NOT_EXECUTED');
+});
+
 function guard(manifest, value) {
   const block = source().split('          # READ_GUARD_PY_BEGIN\n')[1]?.split('          # READ_GUARD_PY_END')[0];
   assert.ok(block, 'guard must be the actual embedded trusted code');
