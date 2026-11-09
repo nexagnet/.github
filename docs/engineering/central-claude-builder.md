@@ -60,6 +60,36 @@ Replace APPROVED_FULL_40_CHAR_SHA with a real reviewed immutable commit after th
 
 ## Status
 
+### Non-Bash credential paths (#36)
+
+The Builder explicitly denies `Read(~/.aws/**)` in `permissions.deny`, in
+addition to the existing sandbox `filesystem.denyRead` entry for `~/.aws`.
+The former targets built-in file tool permissions; the latter configures the
+shell sandbox. Neither a contract test nor a Bash negative probe establishes
+that the actual Read, Glob and Grep tools denied access.
+
+The Action pin is `anthropics/claude-code-action@6fed3ca145920b639991cb756090506e1bcaf515`.
+Its `src/entrypoints/run.ts` selects Claude Code `2.1.293`. The upstream
+[permission documentation](https://code.claude.com/docs/en/permissions#read-and-edit)
+describes home-relative patterns and best-effort application of Read rules to
+Grep and Glob, and separately documents symlink target checks. These are vendor
+semantics, not an observed denial in this consumer runtime.
+
+Status: **SOURCE_IMPLEMENTED; runtime Read denial NOT_PROVEN**. Do not close #36,
+enable credential-bearing MCP, or treat this change as ready for owner merge
+until independent current-HEAD review and the required canary proof exist.
+
+An authorized disposable consumer probe must create synthetic nonsecret fixtures
+in an isolated test home, with no real AWS/user credential directory mounted.
+It must request Read, Glob and Grep for the home-relative and absolute target,
+a repository symlink to that target, a normalized `..` alias, and a permitted
+control file. Trusted instrumentation must record each attempted tool/path
+and actual deny or allowed-control result without logging file contents.
+Missing attempts, missing control reads, errors instead of explicit denials,
+duplicate results, or an unverified tool version yield **NOT_PROVEN**.
+Bash, subprocess and MCP isolation remain separate #32/#37 requirements.
+No such credential-bearing or model-billed diagnostic is run by contract CI.
+
 CENTRAL-SOURCE-VALIDATED requires exact-head tests and independent review.
 CENTRAL-MERGED requires owner merge plus exact-main evidence.
 CONSUMER-RUNTIME-PROVEN additionally requires an approved publisher App, consumer caller and live proof.
