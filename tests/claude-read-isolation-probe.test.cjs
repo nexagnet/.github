@@ -136,6 +136,24 @@ test('main attaches observational execution diagnostics without weakening native
   assert.equal(invalid.proof.execution_diag.execution_state, 'NOT_EXECUTED');
 });
 
+test('structured SDK API status is quantized without echoing arbitrary or duplicate values', () => {
+  const final = { type: 'result', subtype: 'success', is_error: true };
+  for (const status of [400, 401, 403, 404, 408, 413, 429, 500, 502, 503, 504, 529]) {
+    assert.equal(executionDiagnostics([{ ...final, api_error_status: status }]).api_error_status, String(status));
+  }
+  assert.equal(executionDiagnostics([{ ...final, api_error_status: 418 }]).api_error_status, 'OTHER');
+  for (const value of [{ ...final }, { ...final, api_error_status: null }]) {
+    assert.equal(executionDiagnostics([value]).api_error_status, 'NONE');
+  }
+  for (const status of [true, '401', { value: '/private/do-not-emit' }]) {
+    const diag = executionDiagnostics([{ ...final, api_error_status: status }]);
+    assert.equal(diag.api_error_status, 'UNKNOWN');
+    assert.equal(diag.diagnostics_valid, false);
+    assert.doesNotMatch(JSON.stringify(diag), /private|do-not-emit/);
+  }
+  assert.equal(executionDiagnostics([final, { ...final, api_error_status: 401 }]).api_error_status, 'UNKNOWN');
+});
+
 function guard(manifest, value) {
   const block = source().split('          # READ_GUARD_PY_BEGIN\n')[1]?.split('          # READ_GUARD_PY_END')[0];
   assert.ok(block, 'guard must be the actual embedded trusted code');

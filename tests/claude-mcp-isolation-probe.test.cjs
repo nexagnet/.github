@@ -68,6 +68,27 @@ test('actual MCP summarize and verify export bounded phase diagnostics with skip
     assert.equal(audit.execution_diag.control.final_is_error, 'TRUE');
     assert.equal(audit.execution_diag.candidate.execution_state, 'NOT_EXECUTED');
     assert.doesNotMatch(JSON.stringify(audit), /private|never-emit-credential/);
+    for (const malformed of [{ rogue: privateMarker },
+      { ...audit.execution_diag.control, final_subtype: { value: privateMarker } },
+      { ...audit.execution_diag.control, signals: [privateMarker] },
+      { ...audit.execution_diag.control, final_count: true }]) {
+      fs.writeFileSync(path.join(folder, 'mcp-isolation/private/control-diag.json'), JSON.stringify(malformed));
+      const invalidDiag = spawnSync(python, [script, 'verify'], { env, encoding: 'utf8' });
+      assert.equal(invalidDiag.status, 1, invalidDiag.stderr);
+      const bounded = JSON.parse(fs.readFileSync(path.join(folder, 'mcp-isolation/private/audit.json'), 'utf8'));
+      assert.equal(bounded.execution_diag.control.execution_state, 'INVALID');
+      assert.doesNotMatch(JSON.stringify(bounded), /private|never-emit-credential|rogue/);
+    }
+    fs.writeFileSync(path.join(folder, 'mcp-isolation/private/candidate.jsonl'), JSON.stringify({ id: 'project', phase: 'candidate', event: 'startup', pid: 456 }) + '\n');
+    for (const raw of ['invalid-json', 'x'.repeat(4097)]) {
+      fs.writeFileSync(path.join(folder, 'mcp-isolation/private/control-diag.json'), raw);
+      const malformedJson = spawnSync(python, [script, 'verify'], { env, encoding: 'utf8' });
+      assert.equal(malformedJson.status, 1);
+      assert.doesNotMatch(malformedJson.stderr, /Traceback|invalid-json|xxxxx/);
+      const retained = JSON.parse(fs.readFileSync(path.join(folder, 'mcp-isolation/private/audit.json'), 'utf8'));
+      assert.equal(retained.verdict, 'MCP_STARTUP_NEGATIVE_FAIL');
+      assert.equal(retained.execution_diag.control.execution_state, 'INVALID');
+    }
   });
 });
 
