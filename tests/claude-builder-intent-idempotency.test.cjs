@@ -542,3 +542,27 @@ test('the draft step refuses to publish without a matching claim, before any loo
     }
   }
 });
+
+
+test('fixed per-Issue claim cannot derive its unique ref from mutable paginated PR totals', () => {
+  assert.doesNotMatch(claim, /gen-\$\{PR_TOTAL\}/);
+  assert.match(claim, /claim="refs\/builder-claims\/issue-\$\{ISSUE_NUMBER\}"/);
+  assert.match(claim, /force=false/);
+});
+
+test('matching PR records with malformed state, identity or merge status fail closed', () => {
+  for (const mutate of [p => { delete p.state; }, p => { p.state = 'unknown'; },
+    p => { p.number = '166'; }, p => { delete p.merged_at; }]) {
+    const pr = h.pull(166, BRANCH(12), 'closed'); mutate(pr);
+    const world = h.makeWorld({ pulls: [[pr]] });
+    try { assert.equal(h.runScript(world, premint).ok, false, JSON.stringify(pr)); }
+    finally { world.cleanup(); }
+  }
+});
+
+test('draft revalidates the live immutable claim identity before pushing', () => {
+  const step = h.jobs.publish.steps.find(s => s.id === 'draft');
+  assert.equal(step.env.CLAIM_SHA, '\$' + '{{ steps.claim.outputs.sha }}');
+  assert.match(draft, /CLAIM_OWNERSHIP_REJECTED/);
+  assert.ok(draft.indexOf('CLAIM_OWNERSHIP_REJECTED') < draft.indexOf('git push origin'));
+});
