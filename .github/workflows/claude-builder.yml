@@ -572,6 +572,7 @@ jobs:
           COMMENT_ID: ${{ needs.preflight.outputs.comment_id }}
         run: |
           set -euo pipefail
+          # shellcheck disable=SC2034 # each caller reads a subset of the PR_* results
           bot_pr_guard() {
             local pages stats
             pages="$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls?state=all&per_page=100" --jq 'map({number,state,merged_at,_has_merged_at:has("merged_at"),head:{ref:.head.ref,repo:(if .head.repo == null then null else {full_name:.head.repo.full_name} end)}})')" || {
@@ -639,9 +640,11 @@ jobs:
             ' <<< "$prior" >/dev/null || { echo "::error::PUBLISH_CLAIM_INVALID: malformed immutable claim"; exit 1; }
             tree="$(jq -er '.tree.sha | select(type == "string" and test("^[0-9a-f]{40}$"))' <<< "$prior")"
             meta="$(jq -r .message <<< "$prior")"
-            test "$COMMAND" = retry && jq -e --arg comment "$COMMENT_ID" --argjson attempt "$ATTEMPT" '
+            if [ "$COMMAND" != retry ] || ! jq -e --arg comment "$COMMENT_ID" --argjson attempt "$ATTEMPT" '
               .attempt < $attempt and ((.comment_id | tonumber) < ($comment | tonumber))
-            ' <<< "$meta" >/dev/null || { echo "::error::CLAIM_REPLAY_REJECTED: command already consumed"; exit 1; }
+            ' <<< "$meta" >/dev/null; then
+              echo "::error::CLAIM_REPLAY_REJECTED: command already consumed"; exit 1
+            fi
             holder_branch="$(jq -r .branch <<< "$meta")"
             holder="$(gh api --method GET "repos/$GITHUB_REPOSITORY/pulls" -f state=all -f head="$GITHUB_REPOSITORY_OWNER:$holder_branch" -f per_page=100)"
             test "${#holder}" -le 65536
