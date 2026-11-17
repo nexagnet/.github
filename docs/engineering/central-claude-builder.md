@@ -90,41 +90,70 @@ running plus one pending run per group and cancels further pending runs, orderin
 runs is not guaranteed, and the lock does not cross repositories. Therefore correctness does
 not depend on it.
 
-**At-most-one Draft is enforced by an atomic claim, not by cleanup.** Right after the restricted
-publisher token is minted and BEFORE any push or PR, the `claim` step creates the git ref
-`refs/builder-claims/issue-<N>-gen-<G>` at the frozen base SHA, where `<G>` is the number of earlier Builder
-PRs (any state) for that Issue. Creating a ref fails with HTTP 422 when the name exists, so exactly one
-publisher can own a generation however many runners passed every check together; the draft step refuses to run
-without a matching `CLAIM_REF`. Because the claim is taken first, a runner that is cancelled, times out, crashes
-or gets a 403 at ANY later point leaves at most the single PR its claim allows; no loser has to survive to run
-a later step. It uses the already-minted publisher token (`contents: write`); no permission is added, and the
-claim step never pushes, edits or deletes anything.
+**At-most-one publication uses one fixed claim per Issue.** After patch validation and
+restricted Publisher token minting, the claim step exclusively creates
+`refs/builder-claims/issue-<N>`. It points to a metadata-only Git commit containing
+schema/repository/Issue, owner comment ID, bounded attempt, workflow run identity,
+branch, frozen base/contract hash and a random nonce. The claim name never depends
+on paginated PR counts. PR pages are projected to bounded fields, validated and
+checked for duplicate identities; malformed or failed API reads fail closed.
 
-- **Holder killed after its PR exists:** that one Draft stays open and blocks every later command
-  (`DUPLICATE_PR_REJECTED`). Close it to retry; the retry takes generation `G+1`.
-- **Holder killed after claiming but before any PR:** only the claim is stranded. Every later attempt for that
-  generation fails closed (`PUBLISH_CLAIM_REJECTED`) and no PR is created. Owner recovery is one explicit act:
-  delete exactly that ref, e.g. `gh api -X DELETE repos/<owner>/<repo>/git/refs/builder-claims/issue-<N>-gen-<G>`,
-  then retry. Safety is preferred over liveness; claims are never auto-released.
-- **Ref API error** (500, 403, rate limit): `PUBLISH_CLAIM_FAILED`, no push, no PR.
-- Claims are never deleted by the workflow (at most 3 per Issue). The post-PR tie-break stays only as defence in
-  depth (for example a manually opened PR in the namespace); it is not relied on, because it cannot run when the
-  runner is killed.
+A new explicit `@claude retry` can advance an existing claim only when its recorded
+holder branch has exactly one same-repository, closed, unmerged PR. An open/merged
+holder or absent/ambiguous holder blocks retry. The owner comment and attempt must
+be newer than the consumed metadata and remain within the three-command budget.
+An intermediate BLOCKED/NO_PATCH can consume a command without publishing; its
+later allowed retry may skip an unclaimed attempt number. Do not edit/delete the
+owner command comments that form the command ledger. The command budget assumes
+that ledger is retained; it is not a hard compute-attempt cap against an owner
+who deliberately rewrites their command history.
 
-Evidence level: the claim, kill-after-POST, kill-after-claim and recovery paths are executed by
-`tests/claude-builder-intent-idempotency.test.cjs` against a fake GitHub that implements exclusive ref creation
-like the real API (SIGKILLed publisher processes, barrier so all racers pass every guard together). That proves the
-shell logic. It does NOT prove live GitHub behaviour: that a non-branch ref under `refs/builder-claims/` can be
-created with the publisher App token, and that GitHub actually returns 422 for a duplicate, remain
-`NOT_PROVEN` until the consumer run after the owner-controlled R3 merge; do not conflate the mocked race with live
-GitHub Actions serialization proof.
+Retry creates a child metadata commit of the previous claim, then updates the
+same ref with `force: false`. Concurrent retries create different nonce-bearing
+sibling commits, so only one can fast-forward the ref. Each retry preserves the
+previous claim's tree: a change to consumer workflows/base code does not introduce
+any file-tree change into the coordination commit or require Workflows permission.
+The metadata still records the new frozen code base SHA.
+
+Before the first push and again before PR creation, Draft publishing re-fetches the
+live ref/commit and verifies its SHA, metadata hash and run/comment/Issue ownership.
+The branch grammar remains `claude/issue-<N>-<run>-<run_attempt>` for Reviewer/Repair.
+The claim coordinates cooperating publishers; it cannot prevent an operator from
+manually creating/reopening arbitrary PRs or modifying coordination refs. Workflow
+concurrency, not the claim, bounds active agents. No post-creation cleanup is
+needed for publication uniqueness; the workflow never closes another
+PR or automatically deletes claims. Restricted App permissions remain Contents write
+and Pull requests write, and the key/token remain outside the agent job.
+
+- **Killed after PR POST:** one Draft can remain; its open state blocks retry.
+  Once the owner explicitly closes it unmerged, a newer authorized retry can advance
+  the fixed claim by non-forced CAS.
+- **Killed after claiming but before PR POST:** the claim is stranded; retries fail
+  closed. Before manual recovery, the owner must verify the holder run is terminal,
+  no process/pending POST can resume and no PR exists for that exact holder branch.
+  Only then release the single fixed ref and post a new bounded retry command.
+  Never release an active or uncertain holder, and never reopen a discarded holder
+  while a newer publication is in progress.
+- API errors, invalid metadata, stale sibling CAS and changed ownership stop before
+  a new PR; no automatic lease timeout, force update or claim deletion exists.
+
+Executable tests run the claim shell against a locked fake GitHub API. They cover
+sibling retry CAS, malformed pagination/metadata, changes to the workflow base, and
+SIGKILL after the claim or a simulated PR POST. The Draft step is also tested with
+a fake push that changes the claim before PR creation.
+
+An isolated GitHub API check using the owner CLI identity confirmed exclusive
+custom ref creation and the non-forced sibling update behavior. Live Publisher App
+permissions, Actions serialization and end-to-end consumer behavior still require
+verification after central merge and consumer rollout.
 
 Audit trail: the PR body records `command`, `attempt` and the trigger comment URL.
 Rejections are single-line `::error::` codes: `INTENT_REJECTED`, `REPLAY_REJECTED`,
 `COMMENT_CHANGED`, `DUPLICATE_COMMAND_REJECTED`, `EXISTING_PR_REJECTED`,
 `RETRY_WITHOUT_ATTEMPT`, `RETRY_BUDGET_EXHAUSTED`, `OPEN_PR_REJECTED`,
 `MERGED_PR_REJECTED`, `PR_LOOKUP_FAILED`, `LEDGER_LOOKUP_FAILED`,
-`DUPLICATE_PR_REJECTED`, `PUBLISH_CLAIM_REJECTED`, `PUBLISH_CLAIM_FAILED`, `DUPLICATE_PUBLISH_RACE_LOST`.
+`DUPLICATE_PR_REJECTED`, `PUBLISH_CLAIM_REJECTED`, `PUBLISH_CLAIM_FAILED`, `PUBLISH_CLAIM_INVALID`, `PUBLISH_CLAIM_STRANDED`, `CLAIM_REPLAY_REJECTED`,
+`CLAIM_OWNERSHIP_REJECTED`.
 
 Consumers on an older pinned SHA keep the old substring behaviour until they re-pin in a
 separate, owner-approved R3 consumer PR.

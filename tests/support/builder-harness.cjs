@@ -65,7 +65,8 @@ const baseEnv = (world, extra) => ({
   GITHUB_EVENT_NAME: 'issue_comment', GITHUB_ACTOR: world.actor,
   GITHUB_EVENT_PATH: join(world.dir, 'event.json'),
   GITHUB_OUTPUT: join(world.dir, 'gh-output'), GITHUB_RUN_ATTEMPT: '1',
-  GH_TOKEN: 'test-read-only-token', ISSUE_NUMBER: '12',
+  GH_TOKEN: 'test-read-only-token', ISSUE_NUMBER: '12', GITHUB_RUN_ID: '7001',
+  CONTRACT_HASH: 'c'.repeat(64), COMMAND: 'run', ATTEMPT: '1', COMMENT_ID: '5000',
   ...extra,
 });
 

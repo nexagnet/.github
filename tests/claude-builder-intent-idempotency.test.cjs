@@ -12,7 +12,6 @@ const gate = h.jobs.preflight.steps.find((s) => s.id === 'gate').run;
 const premint = h.stepByName('publish', 'Re-check no competing Builder PR').run;
 const draft = h.jobs.publish.steps.find((s) => s.id === 'draft').run;
 const claim = h.jobs.publish.steps.find((s) => s.id === 'claim').run;
-const tiebreak = h.stepByName('publish', 'Resolve publish race').run;
 const BRANCH = (issueNo, run = 7001, attempt = 1) => `claude/issue-${issueNo}-${run}-${attempt}`;
 
 function preflightOutcome(opts, extraEnv = {}) {
@@ -231,8 +230,7 @@ test('publisher guard runs before the write token and again right before the fir
   const mintIdx = idx((s) => s.id === 'publisher');
   const draftIdx = idx((s) => s.id === 'draft');
   const claimIdx = idx((s) => s.id === 'claim');
-  const tieIdx = idx((s) => s.name?.startsWith('Resolve publish race'));
-  assert.ok(validateIdx < premintIdx && premintIdx < mintIdx && mintIdx < claimIdx && claimIdx < draftIdx && draftIdx < tieIdx);
+  assert.ok(validateIdx < premintIdx && premintIdx < mintIdx && mintIdx < claimIdx && claimIdx < draftIdx);
   assert.ok(draft.indexOf('\nbot_pr_guard\n') < draft.indexOf('git push'));
   assert.ok(draft.indexOf('DUPLICATE_PR_REJECTED') < draft.indexOf('git push'));
   assert.equal(steps[premintIdx].env.GH_TOKEN, '${{ github.token }}', 'pre-mint check uses the read-only token');
@@ -243,7 +241,7 @@ test('publisher guard runs before the write token and again right before the fir
 test('the PR guard is byte-identical in preflight and all publisher steps', () => {
   const reference = h.extractFunction(gate, 'bot_pr_guard');
   assert.ok(reference && reference.includes('--paginate'));
-  for (const [name, script] of [['premint', premint], ['claim', claim], ['draft', draft], ['tiebreak', tiebreak]]) {
+  for (const [name, script] of [['premint', premint], ['claim', claim], ['draft', draft]]) {
     assert.equal(h.extractFunction(script, 'bot_pr_guard'), reference, name);
   }
 });
@@ -273,276 +271,260 @@ test('concurrency: one workflow-level group per repository+Issue, no job-level r
   assert.equal((h.source.match(/^\s*concurrency:/gm) || []).length, 1);
 });
 
-// Several publishers pass every check before any PR exists (the worst-case ordering the
-// ledger and serialization are meant to prevent). The tie-break must leave exactly one.
-async function raceOf(n) {
-  const world = h.makeWorld({ dynamicPulls: [] });
-  try {
-    h.writeFileSync(join(world.dir, 'premint.sh'), premint);
-    h.writeFileSync(join(world.dir, 'tiebreak.sh'), tiebreak);
-    const flows = [];
-    for (let i = 0; i < n; i++) {
-      const flow = join(world.dir, `flow-${i}.sh`);
-      h.writeFileSync(flow, [
-        'set -euo pipefail',
-        `bash "${join(world.dir, 'premint.sh')}"`,
-        'created="$(gh api -X POST "repos/$GITHUB_REPOSITORY/pulls" -f title=t -f head="$BRANCH" -f base=main -F draft=true -f body=b)"',
-        'export PR_NUMBER="$(jq -r .number <<< "$created")"',
-        `bash "${join(world.dir, 'tiebreak.sh')}"`,
-      ].join('\n'));
-      flows.push(h.spawnScript(world, flow, { FLOW_ID: String(i), BARRIER_N: String(n), BRANCH: BRANCH(12, 9000 + i) }));
-    }
-    const results = await Promise.all(flows);
-    const state = JSON.parse(readFileSync(join(world.dir, 'pulls-state.json'), 'utf8'));
-    const deletedLog = join(world.dir, 'deleted-refs.log');
-    const deleted = existsSync(deletedLog) ? readFileSync(deletedLog, 'utf8').trim().split('\n') : [];
-    return { results, state, deleted };
-  } finally {
-    world.cleanup();
-  }
-}
 
-test('concurrent publishers: exactly one open Draft survives (lowest PR number), losers close only themselves', async () => {
-  for (const n of [2, 4]) {
-    const { results, state, deleted } = await raceOf(n);
-    const open = state.prs.filter((p) => p.state === 'open');
-    assert.equal(state.prs.length, n, 'every racer created a PR (all checks passed together)');
-    assert.equal(open.length, 1, `n=${n}: exactly one open PR`);
-    assert.equal(open[0].number, 100, 'lowest PR number wins');
-    assert.equal(results.filter((r) => r.ok).length, 1, 'only the winner succeeds');
-    for (const r of results.filter((x) => !x.ok)) assert.match(r.stderr, /DUPLICATE_PUBLISH_RACE_LOST/);
-    assert.equal(deleted.length, n - 1, 'each loser deletes only its own branch');
-    assert.ok(!deleted.some((d) => d.endsWith(open[0].head.ref)), 'winner branch is never deleted');
-  }
-});
-
-test('tie-break fails closed when own PR is not visible and validates its inputs', () => {
-  const world = h.makeWorld({ dynamicPulls: [] });
-  try {
-    const bad = h.runScript(world, tiebreak, { PR_NUMBER: '100', BRANCH: BRANCH(12) });
-    assert.equal(bad.ok, false);
-    assert.match(bad.stderr, /PUBLISH_STATE_UNKNOWN/);
-    assert.equal(h.runScript(world, tiebreak, { PR_NUMBER: 'abc', BRANCH: BRANCH(12) }).ok, false);
-    assert.equal(h.runScript(world, tiebreak, { PR_NUMBER: '100', BRANCH: 'main' }).ok, false);
-    assert.equal(h.runScript(world, tiebreak, { PR_NUMBER: '100', BRANCH: BRANCH(13) }).ok, false, 'branch of another Issue');
-  } finally {
-    world.cleanup();
-  }
-});
-
-test('publisher keeps Draft-only publishing, no extra scopes, and records the audited trigger', () => {
-  const mint = h.jobs.publish.steps.find((s) => s.id === 'publisher');
-  assert.equal(mint.with['permission-contents'], 'write');
-  assert.equal(mint.with['permission-pull-requests'], 'write');
-  assert.equal(mint.with['permission-workflows'], undefined);
-  assert.equal(mint.with['permission-administration'], undefined);
-  assert.match(draft, /-F draft=true/);
-  assert.match(draft, /Trigger: command=\$COMMAND attempt=\$ATTEMPT\/3 comment=/);
-  assert.match(draft, /branch="claude\/issue-\$ISSUE_NUMBER-\$GITHUB_RUN_ID-\$GITHUB_RUN_ATTEMPT"/, 'branch shape Reviewer/Repair parse');
-  assert.equal(h.jobs.agent.permissions.contents, 'read');
-  assert.ok(!JSON.stringify(h.jobs.agent).includes('secrets.BUILDER_PUBLISHER'));
-});
-
-// ---------------------------------------------------------------------------------------------------------------
-// Durable at-most-one (review of PR #34): the invariant must NOT depend on a losing runner surviving to run a later
-// tie-break. A publisher is simulated as a separate OS process that is SIGKILLed at a chosen point (a cancelled or
-// crashed runner); the fake GitHub enforces atomic, exclusive ref creation exactly like the real API (422).
-// Synthetic data only; the real claim/publish shell is what executes. NOT live GitHub Actions proof.
-// ---------------------------------------------------------------------------------------------------------------
 const BASE_SHA = 'a'.repeat(40);
-const CLAIM_REF = (issueNo, gen) => `refs/builder-claims/issue-${issueNo}-gen-${gen}`;
-
-function prepareFlows(world) {
+const FIXED_REF = 'refs/builder-claims/issue-12';
+const env = (over = {}) => ({ BASE_SHA, ...over });
+const refsOf = world => JSON.parse(readFileSync(join(world.dir, 'refs-state.json'), 'utf8'));
+const prsOf = world => JSON.parse(readFileSync(join(world.dir, 'pulls-state.json'), 'utf8')).prs;
+const commitsOf = world => JSON.parse(readFileSync(join(world.dir, 'commits-state.json'), 'utf8'));
+const metadataOf = world => JSON.parse(commitsOf(world)[refsOf(world)[FIXED_REF]].message);
+const claimRun = (world, over = {}) => h.runScript(world, claim, env(over));
+function seedClosedHolder(world) {
+  const r = claimRun(world); assert.equal(r.ok, true, r.stderr);
+  h.writeFileSync(join(world.dir, 'pulls-state.json'), JSON.stringify({ next: 101, prs: [h.pull(100, BRANCH(12), 'closed')] }));
+  return r;
+}
+function prepareFlow(world) {
   h.writeFileSync(join(world.dir, 'claim.sh'), claim);
-  h.writeFileSync(join(world.dir, 'premint.sh'), premint);
-  h.writeFileSync(join(world.dir, 'tiebreak.sh'), tiebreak);
   h.writeFileSync(join(world.dir, 'flow.sh'), [
-    'set -euo pipefail',
-    'if [ -n "${LEGACY:-}" ]; then',
-    `  bash "${join(world.dir, 'premint.sh')}"`,
-    'else',
-    `  bash "${join(world.dir, 'claim.sh')}"`,
-    '  if [ -n "${DIE_AFTER_CLAIM:-}" ]; then kill -KILL $$; fi',
-    'fi',
-    'created="$(gh api -X POST "repos/$GITHUB_REPOSITORY/pulls" -f title=t -f head="$BRANCH" -f base=main -F draft=true -f body=b)"',
+    'set -euo pipefail', `bash "${join(world.dir, 'claim.sh')}"`,
+    'if [ -n "${DIE_AFTER_CLAIM:-}" ]; then kill -KILL $$; fi',
+    'gh api -X POST "repos/$GITHUB_REPOSITORY/pulls" -f title=t -f head="$BRANCH" -f base=main -F draft=true -f body=b >/dev/null',
     'if [ -n "${DIE_AFTER_POST:-}" ]; then kill -KILL $$; fi',
-    'export PR_NUMBER="$(jq -r .number <<< "$created")"',
-    `bash "${join(world.dir, 'tiebreak.sh')}"`,
   ].join('\n'));
 }
-const flowEnv = (extra = {}) => ({ BASE_SHA, ...extra });
-const runFlows = (world, n, perFlow = () => ({})) => Promise.all(
-  Array.from({ length: n }, (_, i) => h.spawnScript(world, join(world.dir, 'flow.sh'), flowEnv({
-    FLOW_ID: String(i), BARRIER_N: String(n), BRANCH: BRANCH(12, 9000 + i), ...perFlow(i),
-  })))
-);
-const runOne = (world, run, extra = {}) =>
-  h.spawnScript(world, join(world.dir, 'flow.sh'), flowEnv({ FLOW_ID: `one-${run}`, BRANCH: BRANCH(12, run), ...extra }));
-const prsOf = (world) => JSON.parse(readFileSync(join(world.dir, 'pulls-state.json'), 'utf8')).prs;
-const claimsOf = (world) => {
-  const f = join(world.dir, 'refs-state.json');
-  return existsSync(f) ? Object.keys(JSON.parse(readFileSync(f, 'utf8'))) : [];
-};
-const killed = (r) => r.status === null;
+function flow(world, run, extra = {}) {
+  return h.spawnScript(world, join(world.dir, 'flow.sh'), env({
+    GITHUB_RUN_ID: String(run), FLOW_ID: String(run), BRANCH: BRANCH(12, run), ...extra,
+  }));
+}
 
-test('FAULT INJECTION: a publisher killed right after its PR was created cannot leave a second open Draft (and recovery works)', async () => {
+test('initial publish atomically creates one fixed Issue claim with bounded immutable identity', () => {
+  const world = h.makeWorld({ dynamicPulls: [] });
+  try {
+    const r = claimRun(world); assert.equal(r.ok, true, r.stderr);
+    assert.equal(r.outputs.ref, FIXED_REF); assert.match(r.outputs.sha, /^[0-9a-f]{40}$/);
+    assert.match(r.outputs.metadata_hash, /^[0-9a-f]{64}$/);
+    const m = metadataOf(world);
+    assert.equal(m.schema, 'nexagnet-builder-claim-v1'); assert.equal(m.repository, h.REPO);
+    assert.equal(m.issue_number, '12'); assert.equal(m.run_id, '7001'); assert.equal(m.attempt, 1);
+    assert.equal(m.comment_id, '5000'); assert.equal(m.branch, BRANCH(12));
+    assert.match(m.nonce, /^[0-9a-f]{32}$/); assert.equal(m.previous_claim_sha, null);
+    const again = claimRun(world); assert.equal(again.ok, false); assert.match(again.stderr, /CLAIM_REPLAY_REJECTED/);
+  } finally { world.cleanup(); }
+});
+
+test('published holder must be exactly one same-repo closed-unmerged PR before a bounded explicit retry', () => {
+  for (const state of ['absent', 'open', 'merged', 'fork', 'multiple', 'closed']) {
+    const world = h.makeWorld({ dynamicPulls: [] });
+    try {
+      const seed = seedClosedHolder(world), old = seed.outputs.sha;
+      let prs = [h.pull(100, BRANCH(12), 'closed')];
+      if (state === 'absent') prs = [];
+      if (state === 'open') prs[0].state = 'open';
+      if (state === 'merged') prs[0].merged_at = '2026-01-01';
+      if (state === 'fork') prs[0].head.repo.full_name = 'attacker/example';
+      if (state === 'multiple') prs.push(h.pull(101, BRANCH(12), 'closed'));
+      h.writeFileSync(join(world.dir, 'pulls-state.json'), JSON.stringify({ next: 102, prs }));
+      const r = claimRun(world, { COMMAND: 'retry', ATTEMPT: '2', COMMENT_ID: '5100', GITHUB_RUN_ID: '7002' });
+      assert.equal(r.ok, state === 'closed', state + r.stderr);
+      if (state === 'closed') {
+        assert.equal(metadataOf(world).previous_claim_sha, old);
+        assert.equal(metadataOf(world).attempt, 2);
+        assert.match(readFileSync(join(world.dir, 'calls.log'), 'utf8'), /force=false/);
+      } else assert.equal(refsOf(world)[FIXED_REF], old, 'old claim survives rejection');
+    } finally { world.cleanup(); }
+  }
+});
+
+test('retries reject old comment, consumed attempt, wrong command and exhausted budget', () => {
+  const world = h.makeWorld({ dynamicPulls: [] });
+  try {
+    const seed = seedClosedHolder(world);
+    for (const over of [{ COMMAND: 'retry', ATTEMPT: '2', COMMENT_ID: '5000' },
+      { COMMAND: 'retry', ATTEMPT: '1', COMMENT_ID: '5100' }, { COMMAND: 'run', ATTEMPT: '2', COMMENT_ID: '5100' },
+      { COMMAND: 'retry', ATTEMPT: '4', COMMENT_ID: '5100' }]) {
+      assert.equal(claimRun(world, over).ok, false, JSON.stringify(over));
+      assert.equal(refsOf(world)[FIXED_REF], seed.outputs.sha);
+    }
+    // Intermediate BLOCKED/NO_PATCH consumes a comment attempt without claiming: final retry may advance to 3.
+    assert.equal(claimRun(world, { COMMAND: 'retry', ATTEMPT: '3', COMMENT_ID: '5200', GITHUB_RUN_ID: '7003' }).ok, true);
+    assert.equal(metadataOf(world).attempt, 3);
+  } finally { world.cleanup(); }
+});
+
+test('no earlier publish claim permits explicit retry after BLOCKED or NO_PATCH without a fake prior PR', () => {
+  const world = h.makeWorld({ dynamicPulls: [] });
+  try {
+    const r = claimRun(world, { COMMAND: 'retry', ATTEMPT: '2', COMMENT_ID: '5100' });
+    assert.equal(r.ok, true, r.stderr); assert.equal(metadataOf(world).attempt, 2);
+    assert.equal(metadataOf(world).previous_claim_sha, null);
+  } finally { world.cleanup(); }
+});
+
+test('invalid matching records and duplicated pagination cannot become a new generation', () => {
+  const duplicate = h.pull(100, BRANCH(12), 'closed');
+  const world = h.makeWorld({ pulls: [[duplicate], [duplicate]] });
+  try { assert.equal(claimRun(world).ok, false); }
+  finally { world.cleanup(); }
+  assert.doesNotMatch(claim, /claim=.*(?:gen-|PR_TOTAL)/);
+});
+
+test('retry keeps the original claim tree when the current code/workflow base changed', () => {
+  const world = h.makeWorld({ dynamicPulls: [] });
+  try {
+    const seed = seedClosedHolder(world), commits = commitsOf(world), nextBase = 'd'.repeat(40);
+    commits[nextBase] = { sha: nextBase, tree: { sha: 'e'.repeat(40) }, parents: [], message: 'new workflow version' };
+    h.writeFileSync(join(world.dir, 'commits-state.json'), JSON.stringify(commits));
+    const r = claimRun(world, { BASE_SHA: nextBase, COMMAND: 'retry', ATTEMPT: '2', COMMENT_ID: '5100' });
+    assert.equal(r.ok, true, r.stderr);
+    const updated = commitsOf(world)[r.outputs.sha];
+    assert.equal(updated.tree.sha, commits[seed.outputs.sha].tree.sha);
+    assert.equal(JSON.parse(updated.message).base_sha, nextBase);
+    assert.equal(updated.parents[0].sha, seed.outputs.sha);
+  } finally { world.cleanup(); }
+});
+
+test('malformed immutable metadata and API failures never advance the claim', () => {
+  for (const mutate of [m => { m.attempt = 4; }, m => { m.run_attempt = '2'; },
+    m => { m.comment_id = 'not-numeric'; }, m => { m.branch = 'main'; },
+    m => { m.previous_claim_sha = 'b'.repeat(40); }, m => { m.nonce = {}; }]) {
+    const world = h.makeWorld({ dynamicPulls: [] });
+    try {
+      const seed = seedClosedHolder(world), commits = commitsOf(world);
+      const m = JSON.parse(commits[seed.outputs.sha].message); mutate(m);
+      commits[seed.outputs.sha].message = JSON.stringify(m);
+      h.writeFileSync(join(world.dir, 'commits-state.json'), JSON.stringify(commits));
+      const r = claimRun(world, { COMMAND: 'retry', ATTEMPT: '2', COMMENT_ID: '5100' });
+      assert.equal(r.ok, false); assert.match(r.stderr, /PUBLISH_CLAIM_INVALID/);
+      assert.equal(refsOf(world)[FIXED_REF], seed.outputs.sha);
+    } finally { world.cleanup(); }
+  }
+  for (const fail of ['pulls', 'pulls-garbage', 'ref-get', 'commit', 'claim']) {
+    const world = h.makeWorld({ dynamicPulls: [] });
+    try { assert.equal(claimRun(world, { FAKE_GH_FAIL: fail }).ok, false, fail); }
+    finally { world.cleanup(); }
+  }
+});
+
+test('malformed parent SHA cannot validate by matching equally malformed metadata', () => {
+  const world = h.makeWorld({ dynamicPulls: [] });
+  try {
+    const seed = seedClosedHolder(world), commits = commitsOf(world), record = commits[seed.outputs.sha];
+    const m = JSON.parse(record.message); m.previous_claim_sha = 'invalid';
+    record.message = JSON.stringify(m); record.parents[0].sha = 'invalid';
+    h.writeFileSync(join(world.dir, 'commits-state.json'), JSON.stringify(commits));
+    const r = claimRun(world, { COMMAND: 'retry', ATTEMPT: '2', COMMENT_ID: '5100' });
+    assert.equal(r.ok, false); assert.match(r.stderr, /PUBLISH_CLAIM_INVALID/);
+    assert.equal(refsOf(world)[FIXED_REF], seed.outputs.sha);
+  } finally { world.cleanup(); }
+});
+
+test('initial racers killed after PR POST cannot strand two Drafts and closed-holder retry recovers', async () => {
   for (const n of [2, 4]) {
     const world = h.makeWorld({ dynamicPulls: [] });
     try {
-      prepareFlows(world);
-      // Every racer passes every guard together (barrier), then whichever owns the claim creates its PR and is killed
-      // BEFORE the tie-break could run. The previous design would strand all n PRs in that case.
-      const results = await runFlows(world, n, () => ({ DIE_AFTER_POST: '1' }));
-      assert.equal(results.filter(killed).length, 1, `n=${n}: only the claim holder reached the PR POST and was killed`);
-      const rejected = results.filter((r) => !killed(r));
-      assert.equal(rejected.length, n - 1);
-      for (const r of rejected) {
-        assert.equal(r.ok, false);
-        assert.match(r.stderr, /PUBLISH_CLAIM_REJECTED/);
-      }
-      assert.equal(prsOf(world).length, 1, 'no loser ever created a PR');
-      assert.equal(prsOf(world).filter((p) => p.state === 'open').length, 1, 'exactly one open Draft survives the kill');
-      assert.deepEqual(claimsOf(world), [CLAIM_REF(12, 0)]);
-
-      if (n === 2) {
-        // Recovery path: a later retry is refused while the stranded Draft is open...
-        const refused = await runOne(world, 9100);
-        assert.equal(refused.ok, false);
-        assert.match(refused.stderr, /DUPLICATE_PR_REJECTED/);
-        assert.equal(prsOf(world).length, 1);
-        // ...and once the owner closes that Draft, the retry takes the NEXT generation and publishes exactly one PR.
-        const close = h.runScript(world, 'gh api -X PATCH "repos/$GITHUB_REPOSITORY/pulls/100" -f state=closed');
-        assert.equal(close.ok, true, close.stderr);
-        const retry = await runOne(world, 9101);
-        assert.equal(retry.ok, true, retry.stderr);
-        assert.equal(prsOf(world).filter((p) => p.state === 'open').length, 1);
-        assert.deepEqual(claimsOf(world).sort(), [CLAIM_REF(12, 0), CLAIM_REF(12, 1)]);
-      }
-    } finally {
-      world.cleanup();
-    }
+      prepareFlow(world);
+      const results = await Promise.all(Array.from({ length: n }, (_, i) => flow(world, 9000 + i, { BARRIER_N: String(n), DIE_AFTER_POST: '1' })));
+      assert.equal(results.filter(r => r.status === null).length, 1);
+      assert.equal(prsOf(world).length, 1); assert.equal(prsOf(world).filter(p => p.state === 'open').length, 1);
+      assert.deepEqual(Object.keys(refsOf(world)), [FIXED_REF]);
+      const reject = await flow(world, 9100, { COMMAND: 'retry', ATTEMPT: '2', COMMENT_ID: '5100' });
+      assert.equal(reject.ok, false);
+      const prs = prsOf(world); prs[0].state = 'closed';
+      h.writeFileSync(join(world.dir, 'pulls-state.json'), JSON.stringify({ next: 101, prs }));
+      const retry = await flow(world, 9101, { COMMAND: 'retry', ATTEMPT: '2', COMMENT_ID: '5100' });
+      assert.equal(retry.ok, true, retry.stderr);
+      assert.equal(prsOf(world).filter(p => p.state === 'open').length, 1);
+    } finally { world.cleanup(); }
   }
 });
 
-test('regression sensitivity: the former tie-break-only flow DOES strand every Draft when the runners are killed after the POST', async () => {
+test('concurrent retry sibling commits use non-force CAS: exactly one advances and publishes', async () => {
   const world = h.makeWorld({ dynamicPulls: [] });
   try {
-    prepareFlows(world);
-    const results = await runFlows(world, 2, () => ({ LEGACY: '1', DIE_AFTER_POST: '1' }));
-    assert.equal(results.filter(killed).length, 2);
-    assert.equal(prsOf(world).filter((p) => p.state === 'open').length, 2, 'this is the defect the claim step removes');
-  } finally {
-    world.cleanup();
-  }
+    const seed = seedClosedHolder(world); prepareFlow(world);
+    const results = await Promise.all(Array.from({ length: 4 }, (_, i) => flow(world, 9200 + i, {
+      BARRIER_N: '4', CAS_BARRIER_N: '4', COMMAND: 'retry', ATTEMPT: '2', COMMENT_ID: '5100',
+    })));
+    assert.equal(results.filter(r => r.ok).length, 1, results.map(r => r.stderr).join('\n'));
+    for (const r of results.filter(r => !r.ok)) assert.match(r.stderr, /PUBLISH_CLAIM_REJECTED/);
+    const descendants = Object.values(commitsOf(world)).filter(c => c.parents[0]?.sha === seed.outputs.sha);
+    assert.equal(descendants.length, 4, 'distinct nonces create four sibling claims');
+    assert.equal(new Set(descendants.map(c => JSON.parse(c.message).nonce)).size, 4);
+    assert.equal(prsOf(world).filter(p => p.state === 'open').length, 1);
+  } finally { world.cleanup(); }
 });
 
-test('FAULT INJECTION: a publisher killed after claiming but before any PR strands only a claim; fail closed, owner release recovers', async () => {
+test('identical retry run identity still creates distinct nonce sibling commits', async () => {
   const world = h.makeWorld({ dynamicPulls: [] });
   try {
-    prepareFlows(world);
-    const dead = await runOne(world, 9200, { DIE_AFTER_CLAIM: '1' });
-    assert.equal(killed(dead), true);
-    assert.deepEqual(claimsOf(world), [CLAIM_REF(12, 0)]);
-    assert.equal(prsOf(world).length, 0, 'no PR was created');
-    const blocked = await runOne(world, 9201);
-    assert.equal(blocked.ok, false);
-    assert.match(blocked.stderr, /PUBLISH_CLAIM_REJECTED/);
-    assert.equal(prsOf(world).length, 0, 'fails closed: still no PR, never a second one');
-    // Owner releases exactly that stranded ref; the retry then publishes exactly one Draft.
-    const release = h.runScript(world, 'gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/builder-claims/issue-12-gen-0"');
-    assert.equal(release.ok, true, release.stderr);
-    assert.deepEqual(claimsOf(world), []);
-    const retry = await runOne(world, 9202);
-    assert.equal(retry.ok, true, retry.stderr);
-    assert.equal(prsOf(world).filter((p) => p.state === 'open').length, 1);
-  } finally {
-    world.cleanup();
-  }
+    const seed = seedClosedHolder(world); prepareFlow(world);
+    const results = await Promise.all(Array.from({ length: 2 }, (_, i) => flow(world, 9400, {
+      FLOW_ID: 'same-' + i, BARRIER_N: '2', CAS_BARRIER_N: '2',
+      COMMAND: 'retry', ATTEMPT: '2', COMMENT_ID: '5100',
+    })));
+    assert.equal(results.filter(r => r.ok).length, 1, results.map(r => r.stderr).join('\n'));
+    const children = Object.values(commitsOf(world)).filter(c => c.parents[0]?.sha === seed.outputs.sha);
+    assert.equal(children.length, 2);
+    assert.equal(new Set(children.map(c => JSON.parse(c.message).nonce)).size, 2);
+    assert.equal(prsOf(world).filter(p => p.state === 'open').length, 1);
+  } finally { world.cleanup(); }
 });
 
-test('claim step executes: generation counts earlier Builder PRs of THIS Issue only', () => {
-  const run = (pulls, env = {}) => {
-    const world = h.makeWorld({ pulls });
-    try {
-      const r = h.runScript(world, claim, { BASE_SHA, ...env });
-      return { ...r, calls: readFileSync(join(world.dir, 'calls.log'), 'utf8'), claims: claimsOf(world) };
-    } finally {
-      world.cleanup();
+test('kill after claiming but before POST strands the fixed slot; no automatic steal or cleanup', async () => {
+  const world = h.makeWorld({ dynamicPulls: [] });
+  try {
+    prepareFlow(world); const dead = await flow(world, 9300, { DIE_AFTER_CLAIM: '1' });
+    assert.equal(dead.status, null); const sha = refsOf(world)[FIXED_REF];
+    const retry = await flow(world, 9301, { COMMAND: 'retry', ATTEMPT: '2', COMMENT_ID: '5100' });
+    assert.equal(retry.ok, false); assert.match(retry.stderr, /PUBLISH_CLAIM_STRANDED/);
+    assert.equal(prsOf(world).length, 0); assert.equal(refsOf(world)[FIXED_REF], sha);
+    assert.doesNotMatch(claim, /-X DELETE|force=true/);
+  } finally { world.cleanup(); }
+});
+
+test('draft verifies live SHA and immutable ownership before push and again before PR POST', () => {
+  const world = h.makeWorld({ dynamicPulls: [] });
+  try {
+    const seed = claimRun(world); assert.equal(seed.ok, true, seed.stderr);
+    const prefix = draft.slice(0, draft.indexOf('# Last look'));
+    const own = { CLAIM_REF: seed.outputs.ref, CLAIM_SHA: seed.outputs.sha, CLAIM_METADATA_HASH: seed.outputs.metadata_hash };
+    assert.equal(h.runScript(world, prefix, env(own)).ok, true);
+    for (const over of [{ CLAIM_SHA: 'f'.repeat(40) }, { CLAIM_METADATA_HASH: 'f'.repeat(64) }, { GITHUB_RUN_ID: '9999' }]) {
+      const r = h.runScript(world, prefix, env({ ...own, ...over }));
+      assert.equal(r.ok, false); assert.match(r.stderr, /CLAIM_OWNERSHIP_REJECTED/);
     }
-  };
-  const fresh = run([[]]);
-  assert.equal(fresh.ok, true, fresh.stderr);
-  assert.equal(fresh.outputs.ref, CLAIM_REF(12, 0));
-  const afterClosed = run([[h.pull(166, BRANCH(12), 'closed'), h.pull(167, BRANCH(13), 'open'), h.pull(168, 'feature/x', 'open')]]);
-  assert.equal(afterClosed.ok, true, afterClosed.stderr);
-  assert.equal(afterClosed.outputs.ref, CLAIM_REF(12, 1), 'one earlier PR of Issue 12; other Issues and branches are not counted');
-  assert.match(afterClosed.calls, /-X POST repos\/nexagnet\/example\/git\/refs /);
+    assert.equal((draft.match(/verify_own_claim \|\|/g) || []).length, 2);
+    assert.doesNotMatch(h.source, /Resolve publish race|DUPLICATE_PUBLISH_RACE_LOST/);
+  } finally { world.cleanup(); }
 });
 
-test('claim step fails closed and creates NO claim on an open/merged PR, lookup errors, API errors or a bad base SHA', () => {
-  const run = (pulls, env = {}) => {
-    const world = h.makeWorld({ pulls });
-    try {
-      const r = h.runScript(world, claim, { BASE_SHA, ...env });
-      return { ...r, calls: readFileSync(join(world.dir, 'calls.log'), 'utf8'), claims: claimsOf(world) };
-    } finally {
-      world.cleanup();
-    }
-  };
-  for (const pulls of [[[h.pull(166, BRANCH(12), 'open')]], [[h.pull(166, BRANCH(12), 'closed', { merged: true })]]]) {
-    const r = run(pulls);
-    assert.equal(r.ok, false);
-    assert.match(r.stderr, /DUPLICATE_PR_REJECTED/);
-    assert.doesNotMatch(r.calls, /git\/refs/, 'no claim is attempted');
-  }
-  for (const fail of ['pulls', 'pulls-garbage']) {
-    const r = run([[]], { FAKE_GH_FAIL: fail });
-    assert.equal(r.ok, false, fail);
-    assert.match(r.stderr, /PR_LOOKUP_FAILED/, fail);
-    assert.doesNotMatch(r.calls, /git\/refs/, fail);
-  }
-  const api = run([[]], { FAKE_GH_FAIL: 'claim' });
-  assert.equal(api.ok, false);
-  assert.match(api.stderr, /PUBLISH_CLAIM_FAILED/);
-  assert.equal(api.outputs.ref, undefined, 'no ref is exported when the claim failed');
-  for (const bad of ['', 'main', 'A'.repeat(40), 'a'.repeat(39)]) {
-    const r = run([[]], { BASE_SHA: bad });
-    assert.equal(r.ok, false, JSON.stringify(bad));
-    assert.doesNotMatch(r.calls, /git\/refs/, JSON.stringify(bad));
-  }
-  assert.equal(run([[]], { ISSUE_NUMBER: '0' }).ok, false);
-  assert.equal(run([[]], { ISSUE_NUMBER: '12; id' }).ok, false);
-});
-
-test('claim step is wired between the publisher token and the push, and the push cannot run without it', () => {
-  const steps = h.jobs.publish.steps;
-  const claimStep = steps.find((s) => s.id === 'claim');
-  const draftStep = steps.find((s) => s.id === 'draft');
-  assert.equal(claimStep.env.GH_TOKEN, '${{ steps.publisher.outputs.token }}', 'uses the already-minted publisher token');
-  assert.equal(h.jobs.publish.permissions['pull-requests'], 'read', 'job token stays read-only');
-  assert.doesNotMatch(claim, /git push|git switch|git commit|-X PATCH|-X DELETE/, 'the claim step never pushes, edits or deletes');
-  assert.equal(draftStep.env.CLAIM_REF, '${{ steps.claim.outputs.ref }}');
-  assert.ok(draft.indexOf('CLAIM_REF') > -1 && draft.indexOf('CLAIM_REF') < draft.indexOf('\nbot_pr_guard\n'), 'claim is verified before the guard and the push');
-  assert.ok(draft.indexOf('CLAIM_REF') < draft.indexOf('git push'));
-  const mint = steps.find((s) => s.id === 'publisher');
-  assert.equal(mint.with['permission-contents'], 'write');
-  assert.equal(mint.with['permission-workflows'], undefined);
-  assert.equal(mint.with['permission-administration'], undefined);
-});
-
-test('the draft step refuses to publish without a matching claim, before any lookup or push', () => {
-  for (const ref of ['', 'refs/builder-claims/issue-13-gen-0', 'refs/heads/main', 'refs/builder-claims/issue-12-gen-x']) {
+test('actual Draft step rejects lost claim after push and publishes once when it still owns the slot', () => {
+  for (const loseClaim of [true, false]) {
     const world = h.makeWorld({ dynamicPulls: [] });
     try {
-      const r = h.runScript(world, draft, { COMMAND: 'run', ATTEMPT: '1', COMMENT_ID: '5000', CLAIM_REF: ref });
-      assert.equal(r.ok, false, JSON.stringify(ref));
-      assert.doesNotMatch(readFileSync(join(world.dir, 'calls.log'), 'utf8'), /pulls|git\/refs/, 'nothing is looked up or created: ' + JSON.stringify(ref));
-    } finally {
-      world.cleanup();
-    }
+      const seed = claimRun(world); assert.equal(seed.ok, true, seed.stderr);
+      h.writeFileSync(join(world.bin, 'git'), [
+        '#!/bin/bash', 'set -euo pipefail', 'case "$1" in',
+        '  rev-parse) printf "%s\n" "$BASE_SHA" ;;',
+        '  check-ref-format|switch|-c) ;;',
+        '  push)',
+        '    if [ "$LOSE_CLAIM" = 1 ]; then printf \'{"refs/builder-claims/issue-12":"%040d"}\' 0 > "$FAKE_GH_DIR/refs-state.json"; fi ;;',
+        '  *) exit 2 ;;', 'esac', '',
+      ].join('\n'), { mode: 0o755 });
+      const r = h.runScript(world, draft, env({
+        CLAIM_REF: seed.outputs.ref, CLAIM_SHA: seed.outputs.sha, CLAIM_METADATA_HASH: seed.outputs.metadata_hash,
+        BASE_BRANCH: 'main', RISK: '1', GITHUB_SERVER_URL: 'https://github.com', LOSE_CLAIM: loseClaim ? '1' : '0',
+      }));
+      assert.equal(r.ok, !loseClaim, r.stderr);
+      assert.equal(prsOf(world).length, loseClaim ? 0 : 1);
+      if (loseClaim) assert.match(r.stderr, /CLAIM_OWNERSHIP_REJECTED: live claim changed before PR creation/);
+      else assert.equal(r.outputs.branch, BRANCH(12));
+    } finally { world.cleanup(); }
   }
 });
-
 
 test('fixed per-Issue claim cannot derive its unique ref from mutable paginated PR totals', () => {
   assert.doesNotMatch(claim, /gen-\$\{PR_TOTAL\}/);

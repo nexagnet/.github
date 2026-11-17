@@ -24,8 +24,7 @@ permissions: {}
 # this group name would deadlock/self-cancel. GitHub keeps at most one running
 # and one pending run per group (extra pending runs are cancelled, order not
 # guaranteed), so correctness never relies on this lock alone: the comment
-# ledger, live PR guard (preflight + publisher) and deterministic tie-break
-# below are independent defences.
+# ledger and fixed publish-claim CAS below are independent defences.
 concurrency:
   group: nexagnet-builder-${{ github.repository }}-issue-${{ inputs.issue_number }}
   cancel-in-progress: false
@@ -61,25 +60,31 @@ jobs:
           # shellcheck disable=SC2034 # each caller reads a subset of the PR_* results
           bot_pr_guard() {
             local pages stats
-            pages="$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls?state=all&per_page=100")" || {
+            pages="$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls?state=all&per_page=100" --jq 'map({number,state,merged_at,_has_merged_at:has("merged_at"),head:{ref:.head.ref,repo:(if .head.repo == null then null else {full_name:.head.repo.full_name} end)}})')" || {
               echo "::error::PR_LOOKUP_FAILED: cannot list pull requests; failing closed"; return 1;
             }
+            test "${#pages}" -le 8388608 || { echo "::error::PR_LOOKUP_FAILED: PR list too large"; return 1; }
             stats="$(jq -s -c --arg repo "$GITHUB_REPOSITORY" \
               --arg re "^claude/issue-${ISSUE_NUMBER}-[1-9][0-9]*-[1-9][0-9]*\$" '
-              (add // [])
+              if all(.[]; type == "array") then (add // []) else error("invalid pages") end
+              | if all(.[]; type == "object" and (.number | type == "number" and floor == . and . > 0)
+                  and (.state | IN("open","closed")) and ._has_merged_at == true
+                  and (.merged_at == null or (.merged_at | type == "string" and length > 0))
+                  and (.head.ref | type == "string")
+                  and (.head.repo == null or (.head.repo.full_name | type == "string")))
+                  and ((map(.number) | unique | length) == length)
+                then . else error("invalid PR records") end
               | map(select((.head.ref | test($re))
                   and ((.head.repo.full_name // "" | ascii_downcase) == ($repo | ascii_downcase))))
               | {open: (map(select(.state == "open")) | length),
                  merged: (map(select(.merged_at != null)) | length),
-                 total: length,
-                 open_min: (map(select(.state == "open") | .number) | min)}
+                 total: length}
             ' <<< "$pages")" || {
               echo "::error::PR_LOOKUP_FAILED: unparsable pull request list; failing closed"; return 1;
             }
             PR_OPEN="$(jq -r .open <<< "$stats")"
             PR_MERGED="$(jq -r .merged <<< "$stats")"
             PR_TOTAL="$(jq -r .total <<< "$stats")"
-            PR_OPEN_MIN="$(jq -r '.open_min // empty' <<< "$stats")"
           }
           test "$GITHUB_REPOSITORY_OWNER" = "nexagnet"
           test "$GITHUB_REPOSITORY" != "nexagnet/.github" || {
@@ -507,25 +512,31 @@ jobs:
           # shellcheck disable=SC2034 # each caller reads a subset of the PR_* results
           bot_pr_guard() {
             local pages stats
-            pages="$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls?state=all&per_page=100")" || {
+            pages="$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls?state=all&per_page=100" --jq 'map({number,state,merged_at,_has_merged_at:has("merged_at"),head:{ref:.head.ref,repo:(if .head.repo == null then null else {full_name:.head.repo.full_name} end)}})')" || {
               echo "::error::PR_LOOKUP_FAILED: cannot list pull requests; failing closed"; return 1;
             }
+            test "${#pages}" -le 8388608 || { echo "::error::PR_LOOKUP_FAILED: PR list too large"; return 1; }
             stats="$(jq -s -c --arg repo "$GITHUB_REPOSITORY" \
               --arg re "^claude/issue-${ISSUE_NUMBER}-[1-9][0-9]*-[1-9][0-9]*\$" '
-              (add // [])
+              if all(.[]; type == "array") then (add // []) else error("invalid pages") end
+              | if all(.[]; type == "object" and (.number | type == "number" and floor == . and . > 0)
+                  and (.state | IN("open","closed")) and ._has_merged_at == true
+                  and (.merged_at == null or (.merged_at | type == "string" and length > 0))
+                  and (.head.ref | type == "string")
+                  and (.head.repo == null or (.head.repo.full_name | type == "string")))
+                  and ((map(.number) | unique | length) == length)
+                then . else error("invalid PR records") end
               | map(select((.head.ref | test($re))
                   and ((.head.repo.full_name // "" | ascii_downcase) == ($repo | ascii_downcase))))
               | {open: (map(select(.state == "open")) | length),
                  merged: (map(select(.merged_at != null)) | length),
-                 total: length,
-                 open_min: (map(select(.state == "open") | .number) | min)}
+                 total: length}
             ' <<< "$pages")" || {
               echo "::error::PR_LOOKUP_FAILED: unparsable pull request list; failing closed"; return 1;
             }
             PR_OPEN="$(jq -r .open <<< "$stats")"
             PR_MERGED="$(jq -r .merged <<< "$stats")"
             PR_TOTAL="$(jq -r .total <<< "$stats")"
-            PR_OPEN_MIN="$(jq -r '.open_min // empty' <<< "$stats")"
           }
           bot_pr_guard
           if [ "$PR_OPEN" -ne 0 ] || [ "$PR_MERGED" -ne 0 ]; then
@@ -546,13 +557,8 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
 
-      # Durable at-most-one guarantee (R3 #33). Creating a git ref fails with 422 when the name exists, so exactly one
-      # publisher can own a generation (= number of earlier Builder PRs for this Issue) however many runners passed
-      # every check together. The claim is taken BEFORE any push or PR and does not depend on a loser surviving to run a
-      # later cleanup step: a runner killed or cancelled at any point leaves at most the one PR its claim allows.
-      # A claim whose holder died before opening a PR fails closed (PUBLISH_CLAIM_REJECTED); the owner releases it by
-      # deleting that single ref (docs/engineering/central-claude-builder.md). Uses the publisher token already minted
-      # (contents: write); no new permission.
+      # A single per-Issue ref serializes publication independently of pagination.
+      # Retry advances immutable metadata by non-forced fast-forward CAS only.
       - id: claim
         name: Claim the single publish slot for this Issue (atomic, before any push)
         shell: bash
@@ -560,50 +566,117 @@ jobs:
           GH_TOKEN: ${{ steps.publisher.outputs.token }}
           ISSUE_NUMBER: ${{ inputs.issue_number }}
           BASE_SHA: ${{ needs.preflight.outputs.base_sha }}
+          CONTRACT_HASH: ${{ needs.preflight.outputs.contract_hash }}
+          COMMAND: ${{ needs.preflight.outputs.command }}
+          ATTEMPT: ${{ needs.preflight.outputs.attempt }}
+          COMMENT_ID: ${{ needs.preflight.outputs.comment_id }}
         run: |
           set -euo pipefail
-          # shellcheck disable=SC2034 # each caller reads a subset of the PR_* results
           bot_pr_guard() {
             local pages stats
-            pages="$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls?state=all&per_page=100")" || {
+            pages="$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls?state=all&per_page=100" --jq 'map({number,state,merged_at,_has_merged_at:has("merged_at"),head:{ref:.head.ref,repo:(if .head.repo == null then null else {full_name:.head.repo.full_name} end)}})')" || {
               echo "::error::PR_LOOKUP_FAILED: cannot list pull requests; failing closed"; return 1;
             }
+            test "${#pages}" -le 8388608 || { echo "::error::PR_LOOKUP_FAILED: PR list too large"; return 1; }
             stats="$(jq -s -c --arg repo "$GITHUB_REPOSITORY" \
               --arg re "^claude/issue-${ISSUE_NUMBER}-[1-9][0-9]*-[1-9][0-9]*\$" '
-              (add // [])
+              if all(.[]; type == "array") then (add // []) else error("invalid pages") end
+              | if all(.[]; type == "object" and (.number | type == "number" and floor == . and . > 0)
+                  and (.state | IN("open","closed")) and ._has_merged_at == true
+                  and (.merged_at == null or (.merged_at | type == "string" and length > 0))
+                  and (.head.ref | type == "string")
+                  and (.head.repo == null or (.head.repo.full_name | type == "string")))
+                  and ((map(.number) | unique | length) == length)
+                then . else error("invalid PR records") end
               | map(select((.head.ref | test($re))
                   and ((.head.repo.full_name // "" | ascii_downcase) == ($repo | ascii_downcase))))
               | {open: (map(select(.state == "open")) | length),
                  merged: (map(select(.merged_at != null)) | length),
-                 total: length,
-                 open_min: (map(select(.state == "open") | .number) | min)}
+                 total: length}
             ' <<< "$pages")" || {
               echo "::error::PR_LOOKUP_FAILED: unparsable pull request list; failing closed"; return 1;
             }
             PR_OPEN="$(jq -r .open <<< "$stats")"
             PR_MERGED="$(jq -r .merged <<< "$stats")"
             PR_TOTAL="$(jq -r .total <<< "$stats")"
-            PR_OPEN_MIN="$(jq -r '.open_min // empty' <<< "$stats")"
           }
-          [[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]*$ ]]
-          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]*$ && "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ && "$CONTRACT_HASH" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$ATTEMPT" =~ ^[1-3]$ && "$COMMENT_ID" =~ ^[1-9][0-9]*$ ]]
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          if [ "$ATTEMPT" = 1 ]; then test "$COMMAND" = run; else test "$COMMAND" = retry; fi
           bot_pr_guard
           if [ "$PR_OPEN" -ne 0 ] || [ "$PR_MERGED" -ne 0 ]; then
-            echo "::error::DUPLICATE_PR_REJECTED: Builder PR already open or merged for Issue #$ISSUE_NUMBER"; exit 1
+            echo "::error::DUPLICATE_PR_REJECTED: existing open or merged Builder PR"; exit 1
           fi
-          [[ "$PR_TOTAL" =~ ^[0-9]+$ ]]
-          claim="refs/builder-claims/issue-${ISSUE_NUMBER}-gen-${PR_TOTAL}"
-          [[ "$claim" =~ ^refs/builder-claims/issue-[1-9][0-9]*-gen-[0-9]+$ ]]
-          git check-ref-format "$claim" >/dev/null
+          claim="refs/builder-claims/issue-${ISSUE_NUMBER}"
+          previous=""
+          tree=""
           err="$(mktemp)"
-          if ! gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="$claim" -f sha="$BASE_SHA" >/dev/null 2>"$err"; then
-            if grep -q 'Reference already exists' "$err"; then
-              echo "::error::PUBLISH_CLAIM_REJECTED: another publisher owns $claim (live or stranded); failing closed"; exit 1
-            fi
-            echo "::error::PUBLISH_CLAIM_FAILED: cannot create $claim; failing closed"; exit 1
+          if ref="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/builder-claims/issue-$ISSUE_NUMBER" 2>"$err")"; then
+            test "${#ref}" -le 65536
+            previous="$(jq -er --arg ref "$claim" 'select(.ref == $ref and .object.type == "commit") | .object.sha | select(type == "string" and test("^[0-9a-f]{40}$"))' <<< "$ref")"
+          elif ! grep -q 'HTTP 404' "$err"; then
+            echo "::error::PUBLISH_CLAIM_FAILED: claim lookup failed"; exit 1
           fi
-          echo "ref=$claim" >> "$GITHUB_OUTPUT"
-          echo "PUBLISH_CLAIMED: $claim"
+          if [ -n "$previous" ]; then
+            prior="$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$previous")"
+            test "${#prior}" -le 65536
+            jq -e --arg sha "$previous" --arg repo "$GITHUB_REPOSITORY" --arg issue "$ISSUE_NUMBER" '
+              (.message | fromjson) as $m
+              | .sha == $sha and (.message | type == "string" and length <= 4000)
+                and (.parents | type == "array" and length == 1)
+                and (.parents[0].sha | type == "string" and test("^[0-9a-f]{40}$"))
+                and $m.schema == "nexagnet-builder-claim-v1" and $m.repository == $repo
+                and $m.issue_number == $issue and $m.run_attempt == "1"
+                and ($m.attempt | type == "number" and floor == . and . >= 1 and . <= 3)
+                and ([$m.run_id,$m.comment_id] | all(.[]; type == "string" and test("^[1-9][0-9]*$")))
+                and ($m.base_sha | type == "string" and test("^[0-9a-f]{40}$"))
+                and ($m.contract_hash | type == "string" and test("^[0-9a-f]{64}$"))
+                and ($m.nonce | type == "string" and test("^[0-9a-f]{32}$"))
+                and $m.branch == ("claude/issue-"+$issue+"-"+$m.run_id+"-1")
+                and (.parents[0].sha == ($m.previous_claim_sha // $m.base_sha))
+            ' <<< "$prior" >/dev/null || { echo "::error::PUBLISH_CLAIM_INVALID: malformed immutable claim"; exit 1; }
+            tree="$(jq -er '.tree.sha | select(type == "string" and test("^[0-9a-f]{40}$"))' <<< "$prior")"
+            meta="$(jq -r .message <<< "$prior")"
+            test "$COMMAND" = retry && jq -e --arg comment "$COMMENT_ID" --argjson attempt "$ATTEMPT" '
+              .attempt < $attempt and ((.comment_id | tonumber) < ($comment | tonumber))
+            ' <<< "$meta" >/dev/null || { echo "::error::CLAIM_REPLAY_REJECTED: command already consumed"; exit 1; }
+            holder_branch="$(jq -r .branch <<< "$meta")"
+            holder="$(gh api --method GET "repos/$GITHUB_REPOSITORY/pulls" -f state=all -f head="$GITHUB_REPOSITORY_OWNER:$holder_branch" -f per_page=100)"
+            test "${#holder}" -le 65536
+            jq -e --arg repo "$GITHUB_REPOSITORY" --arg branch "$holder_branch" '
+              type == "array" and length == 1 and (.[0] |
+                (.number | type == "number" and floor == . and . > 0)
+                and .head.ref == $branch and .head.repo.full_name == $repo
+                and .state == "closed" and has("merged_at") and .merged_at == null)
+            ' <<< "$holder" >/dev/null || { echo "::error::PUBLISH_CLAIM_STRANDED: prior holder lacks one closed unmerged PR; owner recovery required"; exit 1; }
+          fi
+          if [ -z "$tree" ]; then tree="$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$BASE_SHA" --jq .tree.sha)"; fi
+          [[ "$tree" =~ ^[0-9a-f]{40}$ ]]
+          nonce="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+          [[ "$nonce" =~ ^[0-9a-f]{32}$ ]]
+          branch="claude/issue-$ISSUE_NUMBER-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          metadata="$(jq -nc --arg repo "$GITHUB_REPOSITORY" --arg issue "$ISSUE_NUMBER" --arg run "$GITHUB_RUN_ID" \
+            --arg comment "$COMMENT_ID" --argjson attempt "$ATTEMPT" --arg branch "$branch" --arg base "$BASE_SHA" \
+            --arg hash "$CONTRACT_HASH" --arg nonce "$nonce" --arg previous "$previous" '
+            {schema:"nexagnet-builder-claim-v1",repository:$repo,issue_number:$issue,run_id:$run,run_attempt:"1",
+             comment_id:$comment,attempt:$attempt,branch:$branch,base_sha:$base,contract_hash:$hash,nonce:$nonce,
+             previous_claim_sha:(if $previous == "" then null else $previous end)}')"
+          payload="$(jq -nc --arg message "$metadata" --arg tree "$tree" --arg parent "${previous:-$BASE_SHA}" '{message:$message,tree:$tree,parents:[$parent]}')"
+          created="$(gh api -X POST "repos/$GITHUB_REPOSITORY/git/commits" --input - <<< "$payload")"
+          sha="$(jq -er '.sha | select(type == "string" and test("^[0-9a-f]{40}$"))' <<< "$created")"
+          if [ -z "$previous" ]; then
+            gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="$claim" -f sha="$sha" >/dev/null 2>"$err" || {
+              echo "::error::PUBLISH_CLAIM_REJECTED: slot already claimed or API failure"; exit 1;
+            }
+          else
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/builder-claims/issue-$ISSUE_NUMBER" -f sha="$sha" -F force=false >/dev/null 2>"$err" || {
+              echo "::error::PUBLISH_CLAIM_REJECTED: stale sibling claim or API failure"; exit 1;
+            }
+          fi
+          { echo "ref=$claim"; echo "sha=$sha"; echo "metadata_hash=$(printf '%s' "$metadata" | sha256sum | awk '{print $1}')"; } >> "$GITHUB_OUTPUT"
+          echo "PUBLISH_CLAIMED: Issue $ISSUE_NUMBER attempt $ATTEMPT"
 
       - id: draft
         name: Publish only a DRAFT PR, never merge or deploy
@@ -612,6 +685,8 @@ jobs:
           GH_TOKEN: ${{ steps.publisher.outputs.token }}
           ISSUE_NUMBER: ${{ inputs.issue_number }}
           CLAIM_REF: ${{ steps.claim.outputs.ref }}
+          CLAIM_SHA: ${{ steps.claim.outputs.sha }}
+          CLAIM_METADATA_HASH: ${{ steps.claim.outputs.metadata_hash }}
           BASE_SHA: ${{ needs.preflight.outputs.base_sha }}
           BASE_BRANCH: ${{ needs.preflight.outputs.base_branch }}
           RISK: ${{ needs.preflight.outputs.risk }}
@@ -623,31 +698,55 @@ jobs:
           # shellcheck disable=SC2034 # each caller reads a subset of the PR_* results
           bot_pr_guard() {
             local pages stats
-            pages="$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls?state=all&per_page=100")" || {
+            pages="$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls?state=all&per_page=100" --jq 'map({number,state,merged_at,_has_merged_at:has("merged_at"),head:{ref:.head.ref,repo:(if .head.repo == null then null else {full_name:.head.repo.full_name} end)}})')" || {
               echo "::error::PR_LOOKUP_FAILED: cannot list pull requests; failing closed"; return 1;
             }
+            test "${#pages}" -le 8388608 || { echo "::error::PR_LOOKUP_FAILED: PR list too large"; return 1; }
             stats="$(jq -s -c --arg repo "$GITHUB_REPOSITORY" \
               --arg re "^claude/issue-${ISSUE_NUMBER}-[1-9][0-9]*-[1-9][0-9]*\$" '
-              (add // [])
+              if all(.[]; type == "array") then (add // []) else error("invalid pages") end
+              | if all(.[]; type == "object" and (.number | type == "number" and floor == . and . > 0)
+                  and (.state | IN("open","closed")) and ._has_merged_at == true
+                  and (.merged_at == null or (.merged_at | type == "string" and length > 0))
+                  and (.head.ref | type == "string")
+                  and (.head.repo == null or (.head.repo.full_name | type == "string")))
+                  and ((map(.number) | unique | length) == length)
+                then . else error("invalid PR records") end
               | map(select((.head.ref | test($re))
                   and ((.head.repo.full_name // "" | ascii_downcase) == ($repo | ascii_downcase))))
               | {open: (map(select(.state == "open")) | length),
                  merged: (map(select(.merged_at != null)) | length),
-                 total: length,
-                 open_min: (map(select(.state == "open") | .number) | min)}
+                 total: length}
             ' <<< "$pages")" || {
               echo "::error::PR_LOOKUP_FAILED: unparsable pull request list; failing closed"; return 1;
             }
             PR_OPEN="$(jq -r .open <<< "$stats")"
             PR_MERGED="$(jq -r .merged <<< "$stats")"
             PR_TOTAL="$(jq -r .total <<< "$stats")"
-            PR_OPEN_MIN="$(jq -r '.open_min // empty' <<< "$stats")"
           }
           [[ "$COMMAND" =~ ^(run|retry)$ ]]
           [[ "$ATTEMPT" =~ ^[1-3]$ ]]
           [[ "$COMMENT_ID" =~ ^[1-9][0-9]*$ ]]
           # No push or PR without the atomic claim taken by the previous step (fails closed when it is absent).
-          [[ "$CLAIM_REF" =~ ^refs/builder-claims/issue-${ISSUE_NUMBER}-gen-[0-9]+$ ]]
+          test "$CLAIM_REF" = "refs/builder-claims/issue-$ISSUE_NUMBER"
+          [[ "$CLAIM_SHA" =~ ^[0-9a-f]{40}$ && "$CLAIM_METADATA_HASH" =~ ^[0-9a-f]{64}$ ]]
+          verify_own_claim() {
+            local current_ref current_commit metadata
+            current_ref="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/builder-claims/issue-$ISSUE_NUMBER")" || return 1
+            test "${#current_ref}" -le 65536 || return 1
+            jq -e --arg ref "$CLAIM_REF" --arg sha "$CLAIM_SHA" '.ref == $ref and .object.type == "commit" and .object.sha == $sha' <<< "$current_ref" >/dev/null || return 1
+            current_commit="$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$CLAIM_SHA")" || return 1
+            test "${#current_commit}" -le 65536 || return 1
+            metadata="$(jq -er --arg sha "$CLAIM_SHA" 'select(.sha == $sha) | .message | select(type == "string" and length <= 4000)' <<< "$current_commit")" || return 1
+            test "$(printf '%s' "$metadata" | sha256sum | awk '{print $1}')" = "$CLAIM_METADATA_HASH" || return 1
+            jq -e --arg issue "$ISSUE_NUMBER" --arg run "$GITHUB_RUN_ID" --arg comment "$COMMENT_ID" --argjson attempt "$ATTEMPT" \
+              --arg repo "$GITHUB_REPOSITORY" --arg base "$BASE_SHA" '
+              .schema == "nexagnet-builder-claim-v1" and .repository == $repo and .issue_number == $issue
+              and .run_id == $run and .run_attempt == "1" and .comment_id == $comment and .attempt == $attempt
+              and .base_sha == $base and .branch == ("claude/issue-"+$issue+"-"+$run+"-1")
+            ' <<< "$metadata" >/dev/null
+          }
+          verify_own_claim || { echo "::error::CLAIM_OWNERSHIP_REJECTED: live claim identity changed"; exit 1; }
           # Last look immediately before the first push with the write token.
           bot_pr_guard
           if [ "$PR_OPEN" -ne 0 ] || [ "$PR_MERGED" -ne 0 ]; then
@@ -672,6 +771,7 @@ jobs:
           Base SHA: $BASE_SHA
           Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
           Trigger: command=$COMMAND attempt=$ATTEMPT/3 comment=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER#issuecomment-$COMMENT_ID"
+          verify_own_claim || { echo "::error::CLAIM_OWNERSHIP_REJECTED: live claim changed before PR creation"; exit 1; }
           created="$(gh api -X POST "repos/$GITHUB_REPOSITORY/pulls" \
             -f title="[claude] Issue #$ISSUE_NUMBER" \
             -f head="$branch" -f base="$BASE_BRANCH" \
@@ -683,54 +783,3 @@ jobs:
             echo "pr_number=$number"
             echo "branch=$branch"
           } >> "$GITHUB_OUTPUT"
-
-      # Defence in depth only. The atomic claim step above is what guarantees at most one Draft; this step
-      # additionally lets the lowest open PR number in this Issue's Builder namespace win if a PR somehow exists
-      # next to another (e.g. a manually opened one), and every later one closes ITSELF (never another PR) and
-      # deletes its own branch. It is NOT relied on for the invariant: it cannot run if the runner is killed.
-      - name: Resolve publish race deterministically (lowest PR number wins)
-        shell: bash
-        env:
-          GH_TOKEN: ${{ steps.publisher.outputs.token }}
-          ISSUE_NUMBER: ${{ inputs.issue_number }}
-          PR_NUMBER: ${{ steps.draft.outputs.pr_number }}
-          BRANCH: ${{ steps.draft.outputs.branch }}
-        run: |
-          set -euo pipefail
-          # shellcheck disable=SC2034 # each caller reads a subset of the PR_* results
-          bot_pr_guard() {
-            local pages stats
-            pages="$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls?state=all&per_page=100")" || {
-              echo "::error::PR_LOOKUP_FAILED: cannot list pull requests; failing closed"; return 1;
-            }
-            stats="$(jq -s -c --arg repo "$GITHUB_REPOSITORY" \
-              --arg re "^claude/issue-${ISSUE_NUMBER}-[1-9][0-9]*-[1-9][0-9]*\$" '
-              (add // [])
-              | map(select((.head.ref | test($re))
-                  and ((.head.repo.full_name // "" | ascii_downcase) == ($repo | ascii_downcase))))
-              | {open: (map(select(.state == "open")) | length),
-                 merged: (map(select(.merged_at != null)) | length),
-                 total: length,
-                 open_min: (map(select(.state == "open") | .number) | min)}
-            ' <<< "$pages")" || {
-              echo "::error::PR_LOOKUP_FAILED: unparsable pull request list; failing closed"; return 1;
-            }
-            PR_OPEN="$(jq -r .open <<< "$stats")"
-            PR_MERGED="$(jq -r .merged <<< "$stats")"
-            PR_TOTAL="$(jq -r .total <<< "$stats")"
-            PR_OPEN_MIN="$(jq -r '.open_min // empty' <<< "$stats")"
-          }
-          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
-          [[ "$BRANCH" =~ ^claude/issue-${ISSUE_NUMBER}-[1-9][0-9]*-[1-9][0-9]*$ ]]
-          bot_pr_guard
-          test -n "$PR_OPEN_MIN" || {
-            echo "::error::PUBLISH_STATE_UNKNOWN: own PR #$PR_NUMBER not visible; failing closed"; exit 1;
-          }
-          if [ "$PR_OPEN_MIN" != "$PR_NUMBER" ]; then
-            gh api -X PATCH "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" -f state=closed >/dev/null
-            gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$BRANCH" >/dev/null || \
-              echo "::warning::could not delete duplicate branch $BRANCH"
-            echo "::error::DUPLICATE_PUBLISH_RACE_LOST: PR #$PR_OPEN_MIN already owns Issue #$ISSUE_NUMBER; closed #$PR_NUMBER"
-            exit 1
-          fi
-          echo "PUBLISH_UNIQUE: PR #$PR_NUMBER is the only open Builder PR for Issue #$ISSUE_NUMBER"

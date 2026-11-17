@@ -17,9 +17,10 @@ const read = (name) => fs.readFileSync(`${dir}/${name}`, 'utf8');
 const exists = (name) => fs.existsSync(`${dir}/${name}`);
 const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
+if (args[0] === 'auth' && args[1] === 'setup-git') process.exit(0);
 if (args[0] !== 'api') die('unknown gh invocation: ' + args.join(' '), 2);
 const paginate = args.includes('--paginate');
-const method = args.includes('-X') ? args[args.indexOf('-X') + 1] : 'GET';
+const method = args.includes('-X') ? args[args.indexOf('-X') + 1] : args.includes('--method') ? args[args.indexOf('--method') + 1] : 'GET';
 const jqIndex = args.indexOf('--jq');
 const jqExpr = jqIndex >= 0 ? args[jqIndex + 1] : null;
 const route = args.find((a) => a.startsWith('repos/'));
@@ -31,6 +32,8 @@ for (let i = 1; i < args.length; i++) {
     fields[args[i + 1].slice(0, eq)] = args[i + 1].slice(eq + 1);
   }
 }
+
+if (args.includes('--input')) Object.assign(fields, JSON.parse(fs.readFileSync(0, 'utf8')));
 
 function emit(text) {
   if (jqExpr) {
@@ -96,6 +99,59 @@ if (/^repos\/[^/]+\/[^/]+$/.test(route) && jqExpr === '.default_branch') {
   } else {
     emit(pages('pulls'));
   }
+} else if (/^repos\/[^/]+\/[^/]+\/pulls$/.test(route) && method === 'GET') {
+  if (failing.includes('holder')) die('HTTP 403');
+  const branch = fields.head.slice(fields.head.indexOf(':') + 1);
+  const prs = exists('pulls-state.json') ? JSON.parse(read('pulls-state.json')).prs
+    : JSON.parse(read('pulls-1.json'));
+  emit(JSON.stringify(prs.filter(pr => pr.head.ref === branch)));
+} else if (/^repos\/[^/]+\/[^/]+\/git\/commits$/.test(route) && method === 'POST') {
+  if (failing.includes('commit')) die('HTTP 500');
+  const commit = withLock(() => {
+    const commits = exists('commits-state.json') ? JSON.parse(read('commits-state.json')) : {};
+    const sha = require('node:crypto').createHash('sha1').update(JSON.stringify(fields)).digest('hex');
+    const value = { sha, message: fields.message, tree: { sha: fields.tree }, parents: fields.parents.map(sha => ({ sha })) };
+    commits[sha] = value; fs.writeFileSync(`${dir}/commits-state.json`, JSON.stringify(commits));
+    return value;
+  });
+  emit(JSON.stringify(commit));
+} else if ((m = route.match(/^repos\/[^/]+\/[^/]+\/git\/commits\/([0-9a-f]{40})$/)) && method === 'GET') {
+  if (failing.includes('commit-get')) die('HTTP 403');
+  const commits = exists('commits-state.json') ? JSON.parse(read('commits-state.json')) : {};
+  const value = commits[m[1]] || (m[1] === 'a'.repeat(40) ? { sha: m[1], tree: { sha: 'b'.repeat(40) }, parents: [], message: 'base' } : null);
+  if (!value) die('HTTP 404');
+  emit(JSON.stringify(value));
+} else if ((m = route.match(/^repos\/[^/]+\/[^/]+\/git\/ref\/(builder-claims\/issue-\d+)$/)) && method === 'GET') {
+  if (failing.includes('ref-get')) die('HTTP 403');
+  const refs = exists('refs-state.json') ? JSON.parse(read('refs-state.json')) : {};
+  const sha = refs['refs/' + m[1]];
+  if (!sha) die('HTTP 404');
+  // Read snapshot BEFORE barrier so retry racers necessarily propose sibling commits.
+  if (process.env.CAS_BARRIER_N) {
+    const marker = `${dir}/cas-${process.env.FLOW_ID}`; fs.writeFileSync(marker, '');
+    const started = Date.now();
+    while (fs.readdirSync(dir).filter(f => f.startsWith('cas-')).length < Number(process.env.CAS_BARRIER_N)) {
+      if (Date.now() - started > 10000) die('CAS barrier timeout'); sleep(3);
+    }
+  }
+  emit(JSON.stringify({ ref: 'refs/' + m[1], object: { type: 'commit', sha } }));
+} else if ((m = route.match(/^repos\/[^/]+\/[^/]+\/git\/refs\/(builder-claims\/issue-\d+)$/)) && method === 'PATCH') {
+  if (failing.includes('claim-update')) die('HTTP 500');
+  if (fields.force !== 'false') die('force must be false');
+  const accepted = withLock(() => {
+    const refs = exists('refs-state.json') ? JSON.parse(read('refs-state.json')) : {};
+    const commits = exists('commits-state.json') ? JSON.parse(read('commits-state.json')) : {};
+    const ref = 'refs/' + m[1], old = refs[ref];
+    let cursor = fields.sha, found = false;
+    for (let i = 0; cursor && i < 5; i++) {
+      if (cursor === old) { found = true; break; }
+      cursor = commits[cursor]?.parents[0]?.sha;
+    }
+    if (!old || !found) return false;
+    refs[ref] = fields.sha; fs.writeFileSync(`${dir}/refs-state.json`, JSON.stringify(refs)); return true;
+  });
+  if (!accepted) die('gh: Update is not a fast forward (HTTP 422)');
+  emit('{}');
 } else if ((m = route.match(/^repos\/([^/]+\/[^/]+)\/pulls$/)) && method === 'POST') {
   const repo = m[1];
   const created = withLock(() => {
