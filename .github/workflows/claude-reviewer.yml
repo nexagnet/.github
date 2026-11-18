@@ -21,6 +21,11 @@ on:
         required: true
 permissions: {}
 
+# V5.1: one Reviewer per PR at a time; never cancel a running review.
+concurrency:
+  group: nexagnet-reviewer-${{ github.repository }}-${{ inputs.pr_number }}
+  cancel-in-progress: false
+
 jobs:
   gate:
     runs-on: ubuntu-24.04
@@ -208,7 +213,7 @@ jobs:
   review:
     needs: gate
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 20
     permissions:
       contents: read
       issues: read
@@ -282,6 +287,7 @@ jobs:
             Return head_sha exactly ${{ needs.gate.outputs.head }}.
           claude_args: >-
             --max-turns 30
+            --model claude-sonnet-5-5
             --allowedTools "Read,Glob,Grep"
             --disallowedTools "Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch"
             --json-schema '{"type":"object","additionalProperties":false,"required":["head_sha","verdict","summary","findings","diff_inspected"],"properties":{"diff_inspected":{"type":"boolean"},"head_sha":{"type":"string"},"verdict":{"enum":["PASS","REQUEST_CHANGES"]},"summary":{"type":"string","maxLength":2000},"findings":{"type":"array","maxItems":12,"items":{"type":"object","additionalProperties":false,"required":["severity","path","line","message"],"properties":{"severity":{"enum":["blocker","major","minor","nit"]},"path":{"type":"string"},"line":{"type":"integer","minimum":1},"message":{"type":"string","maxLength":2000}}}}}}'
