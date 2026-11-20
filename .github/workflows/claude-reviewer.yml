@@ -448,6 +448,7 @@ jobs:
       issues: read
     steps:
       - name: Verify exact HEAD and report (trusted job; no merge)
+        id: report
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -488,6 +489,7 @@ jobs:
             and .head.repo.full_name == $repo and .base.repo.full_name == $repo
           ' <<< "$pr" >/dev/null; then
             echo "::warning::PR #$PR da merge truoc khi report; review hop le cho SHA $SHA, bo qua dang comment."
+            echo "merged=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           jq -e --arg sha "$SHA" --arg repo "$GITHUB_REPOSITORY" '
@@ -565,9 +567,10 @@ jobs:
           jq -n --arg body "$msg" '{body:$body}' |
             gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --input - --jq .html_url
       - name: Upload exact-head reviewer evidence for trusted consumers
+        if: steps.report.outputs.merged != 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: nexagnet-review-evidence
           path: ${{ runner.temp }}/review-evidence.json
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 14
