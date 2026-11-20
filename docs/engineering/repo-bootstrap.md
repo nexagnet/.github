@@ -40,11 +40,16 @@ gh api orgs/nexagnet/rulesets
 
 Nếu gói tổ chức hỗ trợ và đã có ruleset cấp tổ chức khớp repo mới, chạy bootstrap với `--skip-ruleset`. Chưa xác minh gói hiện tại của `nexagnet` có hỗ trợ hay không: phiên làm việc bị giới hạn ở endpoint của từng repo.
 
-## Việc chỉ chủ làm được
+## Mỗi repo mới, chủ cần làm gì
 
-- Đăng nhập `gh` bằng tài khoản admin và chạy lệnh `--apply` (phiên Claude không tự chạy lên repo thật).
-- Thêm secret `CLAUDE_CODE_OAUTH_TOKEN` vào repo mới (Settings > Secrets and variables > Actions), và bảo đảm Actions cho phép dùng workflow reusable từ `nexagnet/.github`.
-- Tạo GitHub App merge và đặt secret khi bật bot tự merge (chưa làm).
+1. Clone `nexagnet/.github`, đăng nhập `gh` bằng tài khoản admin, chạy: `scripts/bootstrap-repo.sh nexagnet/<repo> --apply --checks <job1,job2>` (thêm `--ignore-regex '\.meta$'` cho Unity). Lệnh tạo nhãn, đặt squash-only, mở PR bootstrap.
+2. Trong PR bootstrap, thay các bước TODO của `ci.yml` bằng lệnh test/lint thật (hoặc đổi `--checks` cho khớp CI có sẵn), chờ `ci` xanh, merge tay (PR chạm `.github/**`).
+3. Chạy lại đúng lệnh ở bước 1 để bật ruleset `main-protection`.
+4. Xong. PR Ready đầu tiên sẽ được Reviewer tự chạy.
+
+Secret `CLAUDE_CODE_OAUTH_TOKEN` được kế thừa từ tổ chức nên **không cần đặt từng repo** (chủ xác nhận; chưa tự kiểm được vì phiên không đọc được secret). Nếu secret tổ chức chỉ áp cho "repo được chọn" thì repo mới phải được thêm vào danh sách đó. Bước thử Reviewer thật trên PR mẫu sẽ xác nhận.
+
+Việc còn lại chỉ chủ làm được: chạy `--apply` (phiên Claude không tự chạy lên repo thật), bảo đảm Actions cho phép dùng workflow reusable từ `nexagnet/.github`, và tạo GitHub App merge khi bật bot tự merge (chưa làm).
 
 ## Kiểm chứng
 
