@@ -1,0 +1,43 @@
+name: ci
+
+# MẪU do scripts/bootstrap-repo.sh thêm vào repo mới. PHẢI sửa trước khi merge:
+# mỗi job dưới đây cố ý FAIL cho tới khi bạn thay bước TODO bằng lệnh build/test thật,
+# để CI không bao giờ "xanh giả". Giữ nguyên tên workflow `ci` và tên 2 job `test`, `lint`
+# (hoặc đổi tên đồng bộ với ruleset `main-protection` và caller Reviewer).
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: TODO thay bằng lệnh test thật của dự án
+        run: |
+          echo "::error::CI mẫu chưa được cấu hình: thay bước này bằng lệnh test thật."
+          exit 1
+
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: TODO thay bằng lệnh kiểm tra tĩnh/lint/kiểm tra cấu trúc thật
+        run: |
+          echo "::error::CI mẫu chưa được cấu hình: thay bước này bằng lệnh lint thật."
+          exit 1

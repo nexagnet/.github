@@ -1,0 +1,33 @@
+name: Nexagnet Reviewer caller
+
+# Gọi Reviewer dùng chung của nexagnet/.github sau khi workflow `ci` xanh trên PR.
+# PR Draft được bỏ qua êm; PR chạm đường dẫn nhạy cảm (.github, CLAUDE.md...) bị từ chối.
+# Ghim SHA 40 ký tự đã duyệt của .github; nâng cấp bằng PR do chủ duyệt.
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  review:
+    if: >-
+      github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.event == 'pull_request'
+      && github.event.workflow_run.pull_requests[0] != null
+    permissions:
+      contents: read
+      actions: read
+      issues: read
+      pull-requests: write
+    uses: nexagnet/.github/.github/workflows/claude-reviewer.yml@__PIN_SHA__
+    with:
+      pr_number: ${{ github.event.workflow_run.pull_requests[0].number }}
+      expected_head_sha: ${{ github.event.workflow_run.head_sha }}
+      ci_run_id: ${{ github.event.workflow_run.id }}
+      required_jobs_csv: __CHECKS_CSV__
+      trusted_authors_csv: __AUTHORS_CSV__
+      ignore_count_regex: '__IGNORE_REGEX__'
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
