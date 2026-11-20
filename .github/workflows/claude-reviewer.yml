@@ -482,10 +482,19 @@ jobs:
               else true end)
           ' <<< "$RESULT" >/dev/null
           pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR")"
+          # PR da merge dung SHA da review: khong dang comment, khong lam check do gia.
+          if jq -e --arg sha "$SHA" --arg repo "$GITHUB_REPOSITORY" '
+            .state == "closed" and .merged_at != null and .head.sha == $sha
+            and .head.repo.full_name == $repo and .base.repo.full_name == $repo
+          ' <<< "$pr" >/dev/null; then
+            echo "::warning::PR #$PR da merge truoc khi report; review hop le cho SHA $SHA, bo qua dang comment."
+            exit 0
+          fi
           jq -e --arg sha "$SHA" --arg repo "$GITHUB_REPOSITORY" '
             .state == "open" and .head.sha == $sha
             and .head.repo.full_name == $repo and .base.repo.full_name == $repo
-          ' <<< "$pr" >/dev/null
+          ' <<< "$pr" >/dev/null \
+            || { echo "::error::PR khong con mo hoac HEAD da doi so voi SHA da review"; exit 1; }
           case "$MODE" in contract|standard) ;; *) echo "::error::Unknown reviewer mode"; exit 1 ;; esac
           if [ "$MODE" = contract ]; then
             # Re-check current owner attestation and linkage after the AI step;
@@ -560,5 +569,5 @@ jobs:
         with:
           name: nexagnet-review-evidence
           path: ${{ runner.temp }}/review-evidence.json
-          if-no-files-found: error
+          if-no-files-found: ignore
           retention-days: 14
