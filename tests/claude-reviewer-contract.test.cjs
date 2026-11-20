@@ -52,7 +52,7 @@ test('deterministic preflight verifies exact-head CI, complete job set, issuer a
     '.head_sha == $sha', '.conclusion == "success"',
     'actions/runs/$RUN/jobs?per_page=100',
     '.status == "completed"', '.name == $n',
-    'length == 1', 'test "$(jq length <<< "$files")" -lt 100',
+    'length == 1', 'test "$counted" -le "$MAX_FILES"',
     'contract=$(printf'
   ]) assert.ok(preflight.includes(token), 'missing: ' + token);
   assert.ok(!preflight.includes('risk:R3) ;;'));
@@ -153,7 +153,8 @@ test('trusted Reviewer prepares bounded exact-base-to-head diff before Claude wi
   assert.ok(diff.run.includes('git diff --no-ext-diff --no-textconv "$BASE...$HEAD_SHA" --'));
   assert.ok(diff.run.includes('> "$RUNNER_TEMP/reviewer-pr-diff.patch"'));
   assert.ok(diff.run.includes('test -s "$RUNNER_TEMP/reviewer-pr-diff.patch"'));
-  assert.ok(diff.run.includes('-le 500000'));
+  assert.ok(diff.run.includes('-le "$MAX_DIFF"'));
+  assert.equal(diff.env.MAX_DIFF, '${{ inputs.max_diff_bytes }}');
   assert.ok(reviewer.with.prompt.includes('reviewer-pr-diff.patch'));
   assert.ok(reviewer.with.prompt.includes('UNTRUSTED data'));
   assert.ok(reviewer.with.prompt.includes('diff_inspected=false'));
@@ -230,4 +231,33 @@ test('trusted Reporter revalidates manual consent and contract after AI review',
   assert.equal(jobs.gate.permissions['pull-requests'], 'read');
   assert.equal(jobs.review.permissions['pull-requests'], 'read');
   assert.equal(jobs.report.permissions['pull-requests'], 'write');
+});
+
+test('shared interface: ordinary lane is default, limits and authors are caller inputs', () => {
+  const inputs = (workflow.on || workflow.true).workflow_call.inputs;
+  assert.equal(inputs.require_task_contract.default, false);
+  assert.equal(inputs.require_task_contract.type, 'boolean');
+  assert.equal(inputs.trusted_authors_csv.default, '');
+  assert.equal(inputs.max_changed_files.default, 100);
+  assert.equal(inputs.ignore_count_regex.default, '');
+  assert.equal(inputs.max_diff_bytes.default, 500000);
+  // Old required inputs stay required; nothing project-specific is hard-coded for the ordinary lane.
+  assert.equal(inputs.required_jobs_csv.required, true);
+  const ordinary = preflight.split('else\n  # Ordinary lane')[1].split('\nfi\n')[0];
+  assert.ok(!/phungtienviet14|NEXAGNET_REVIEW_REQUEST|risk:|## OBJECTIVE/.test(ordinary));
+});
+
+test('Draft PRs are skipped without running the AI job or the reporter', () => {
+  assert.equal(jobs.gate.outputs.skip, '${{ steps.verify.outputs.skip }}');
+  assert.equal(jobs.review.if, "needs.gate.outputs.skip != 'true'");
+  assert.match(jobs.report.if, /needs\.review\.result == 'success'/);
+  assert.match(preflight, /\.draft == true/);
+});
+
+test('Reporter in ordinary mode rechecks draft and author, writes issue:null evidence', () => {
+  assert.match(reporter, /case "\$MODE" in contract\|standard\)/);
+  assert.match(reporter, /\.draft == false/);
+  assert.match(reporter, /issue_json=null/);
+  assert.equal(jobs.report.steps[0].env.MODE, '${{ needs.gate.outputs.mode }}');
+  assert.equal(jobs.report.steps[0].env.AUTHORS, '${{ inputs.trusted_authors_csv }}');
 });

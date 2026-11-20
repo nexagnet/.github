@@ -135,3 +135,51 @@ requires actual diff inspection and same-SHA trusted verdict/artifact.
 5. If errors, disable only the new consumer caller via R3 owner-approved PR. V4 is fallback. Do not auto-merge R2/R3 or deploy production.
 
 No App installation, secret provisioning, repo ruleset or production changes are authorized by this file.
+
+## Ordinary PR lane and shared inputs (project-independent)
+
+The Reviewer is parameterized so any repository in the organization can use it with a thin caller. All new inputs are optional; the defaults give the **ordinary PR lane**.
+
+| Input | Default | Meaning |
+|---|---|---|
+| `require_task_contract` | `false` | `false`: ordinary lane. `true`: previous lane (exactly one Task Contract Issue, one `risk:R0/R1/R2` label, Publisher bot or owner attestation). Existing callers that need the old behavior must pass `true`. |
+| `trusted_authors_csv` | `''` | Ordinary lane: GitHub logins whose same-repository PRs are reviewed. The Publisher bot is always allowed. Empty means only the bot. |
+| `max_changed_files` | `100` | Maximum counted changed files. |
+| `ignore_count_regex` | `''` | jq regex of paths that are **not counted** toward the limit, e.g. `\.meta$` for Unity. Ignored files still go through the protected-path check. |
+| `max_diff_bytes` | `500000` | Maximum diff handed to the reviewer (1 to 1000000). |
+
+Ordinary lane rules:
+
+- No Issue, Task Contract, risk label, owner comment or `claude/*` branch is required. The goal is read from the PR description; an empty or vague description makes the reviewer return `REQUEST_CHANGES` and say what is missing.
+- Draft PRs are skipped: the gate exits successfully with `skip=true`, the AI job and the reporter do not run, and no red check is created. Mark the PR Ready to review it. If a PR becomes Draft during the review, the reporter does not publish.
+- Authority comes only from author identity, exact-HEAD `ci` success (workflow `ci`, file `.github/workflows/ci.yml`, event `pull_request`, every name in `required_jobs_csv` succeeded exactly once), the read-only review and the protected-path gate (`.github`, `.claude`, `infra`, `deploy`, `tools/autopilot`, `CLAUDE.md`, `AGENTS.md`, `.mcp.json`, `.env*`). PRs touching those paths go through the human process.
+- The changed-file list is paginated (GitHub caps it at 3000; at 3000 the gate fails closed).
+- Evidence keeps schema `nexagnet-review-v1`; in the ordinary lane `issue` is `null`, `risk` is `"none"` and the gate/reporter `provenance` is `standard`. Consumers that need an Issue/risk (the draft Autonomy in PR #12) must be adapted before using ordinary-lane evidence.
+- Unchanged: reviewer is read-only (`Read,Glob,Grep`), three jobs, exact HEAD recheck, bounded diff, evidence artifact, no Repair trigger, no merge authority.
+
+Thin caller (consumer repo, default branch, pin a reviewed 40-character SHA of this repository):
+
+```yaml
+name: Nexagnet Reviewer caller
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+permissions: {}
+jobs:
+  review:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.pull_requests[0] != null
+    permissions: {contents: read, actions: read, issues: read, pull-requests: write}
+    uses: nexagnet/.github/.github/workflows/claude-reviewer.yml@APPROVED_FULL_40_CHAR_SHA
+    with:
+      pr_number: ${{ github.event.workflow_run.pull_requests[0].number }}
+      expected_head_sha: ${{ github.event.workflow_run.head_sha }}
+      ci_run_id: ${{ github.event.workflow_run.id }}
+      required_jobs_csv: job-one,job-two
+      trusted_authors_csv: owner-login
+      ignore_count_regex: '\.meta$'   # optional
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+```
+
+The caller file is **not deployed by this change**; each consumer adds it in its own PR. The `required_jobs_csv` list must contain at least two job names (existing gate rule).
