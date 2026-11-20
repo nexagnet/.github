@@ -173,6 +173,18 @@ test('--no-merge-bot không thêm caller dù workflow đã có; sensitive regex 
   assert.deepEqual(writes(bad.calls), []);
 });
 
+test('tên secret App merge tùy chỉnh được map trong caller; tên xấu bị từ chối', () => {
+  const r = run([R, '--apply', '--pin-sha', SHA, '--app-id-secret', 'AUTOPILOT_APP_ID', '--app-key-secret', 'AUTOPILOT_APP_PRIVATE_KEY'], freshState({ central: [WF] }));
+  assert.equal(r.status, 0, r.stderr);
+  const caller = r.state.files[AUTO];
+  assert.match(caller, /AUTONOMY_MERGE_APP_ID: \$\{\{ secrets\.AUTOPILOT_APP_ID \}\}/);
+  assert.match(caller, /AUTONOMY_MERGE_APP_PRIVATE_KEY: \$\{\{ secrets\.AUTOPILOT_APP_PRIVATE_KEY \}\}/);
+  assert.doesNotMatch(caller, /__[A-Z_]+__/);
+  const bad = run([R, '--apply', '--pin-sha', SHA, '--app-id-secret', 'x}}'], freshState({ central: [WF] }));
+  assert.notEqual(bad.status, 0);
+  assert.deepEqual(writes(bad.calls), []);
+});
+
 test('caller bot merge mẫu: quyền tối thiểu và không có bí mật cứng', () => {
   const t = readFileSync(path.join(repoRoot, 'templates/repo-bootstrap/nexagnet-claude-autonomy.yml'), 'utf8');
   assert.match(t, /^permissions: \{\}$/m);

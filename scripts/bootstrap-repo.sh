@@ -5,6 +5,7 @@
 #   scripts/bootstrap-repo.sh OWNER/REPO --apply [tùy chọn]  # thực hiện
 #   scripts/bootstrap-repo.sh --check-org OWNER              # chỉ đọc: gói tổ chức và ruleset cấp tổ chức
 #   --no-merge-bot    không thêm caller bot merge (mặc định BẬT khi .github đã có claude-autonomy.yml)
+#   --app-id-secret NAME / --app-key-secret NAME  tên secret org của GitHub App merge (mặc định AUTONOMY_MERGE_APP_ID / AUTONOMY_MERGE_APP_PRIVATE_KEY)
 #   --sensitive-regex RE  đường dẫn nhạy cảm riêng của dự án: PR chạm vào chỉ nhận READY_FOR_MANUAL_MERGE
 #
 # Việc làm (theo thứ tự):
@@ -53,7 +54,7 @@ fi
 repo="${1:-}"; [[ "$repo" == "-h" || "$repo" == "--help" ]] && usage 0
 [[ "$repo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || usage 2
 shift
-apply=0 skip_labels=0 skip_settings=0 skip_files=0 skip_ruleset=0 with_merge_bot=1 merge_bot_explicit=0 sensitive_regex=""
+apply=0 skip_labels=0 skip_settings=0 skip_files=0 skip_ruleset=0 with_merge_bot=1 merge_bot_explicit=0 sensitive_regex="" app_id_secret=AUTONOMY_MERGE_APP_ID app_key_secret=AUTONOMY_MERGE_APP_PRIVATE_KEY
 checks="test,lint" authors="" ignore_regex="" pin_sha=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -64,6 +65,8 @@ while [[ $# -gt 0 ]]; do
     --skip-ruleset) skip_ruleset=1 ;;
     --with-merge-bot) with_merge_bot=1; merge_bot_explicit=1 ;;
     --no-merge-bot) with_merge_bot=0 ;;
+    --app-id-secret) app_id_secret="${2:?}"; shift ;;
+    --app-key-secret) app_key_secret="${2:?}"; shift ;;
     --sensitive-regex) sensitive_regex="${2:?}"; shift ;;
     --checks) checks="${2:?}"; shift ;;
     --authors) authors="${2:?}"; shift ;;
@@ -80,6 +83,7 @@ done
 [[ -z "$pin_sha" || "$pin_sha" =~ ^[0-9a-f]{40}$ ]] || die "--pin-sha phải là SHA 40 ký tự"
 [[ -z "$authors" || "$authors" =~ ^[A-Za-z0-9-]+(,[A-Za-z0-9-]+)*$ ]] || die "--authors không hợp lệ"
 
+[[ "$app_id_secret" =~ ^[A-Z][A-Z0-9_]{2,63}$ && "$app_key_secret" =~ ^[A-Z][A-Z0-9_]{2,63}$ ]] || die "tên secret phải là CHỮ HOA/số/gạch dưới"
 [[ -z "$sensitive_regex" || ( ${#sensitive_regex} -le 200 && "$sensitive_regex" != *"'"* && "$sensitive_regex" != *"#"* ) ]] \
   || die "--sensitive-regex quá dài hoặc chứa dấu ' hay #"
 
@@ -147,6 +151,7 @@ if [[ $skip_files -eq 0 ]]; then
   render() { # render <template> -> stdout
     sed -e "s#__PIN_SHA__#$pin_sha#g" -e "s#__CHECKS_CSV__#$checks#g" \
         -e "s#__AUTHORS_CSV__#$authors#g" -e "s#__IGNORE_REGEX__#${ignore_regex//\\/\\\\}#g" \
+        -e "s#__APP_ID_SECRET__#$app_id_secret#g" -e "s#__APP_KEY_SECRET__#$app_key_secret#g" \
         -e "s#__SENSITIVE_REGEX__#${sensitive_regex//\\/\\\\}#g" "$1"
   }
   declare -A want=( [".github/workflows/ci.yml"]="$TEMPLATE_DIR/ci.yml"
