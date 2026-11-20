@@ -14,18 +14,18 @@ Cần `gh` đăng nhập bằng tài khoản có **quyền admin repo**, cùng `
 
 ## Lệnh làm gì (theo thứ tự, chạy lại an toàn)
 
-1. **Nhãn `needs-human`**: PR có nhãn này thì bot không tự merge (bot merge chưa có; xem kế hoạch PR 4). Không còn nhãn R0/R1/R2 cho PR thường.
+1. **Nhãn `needs-human`**: PR có nhãn này thì bot không tự merge (xem `central-claude-autonomy.md`). Không còn nhãn R0/R1/R2 cho PR thường.
 2. **Cài đặt repo**: chỉ squash merge (tắt merge commit và rebase), tự xóa nhánh sau merge.
 3. **PR bootstrap** (nhánh `claude/bootstrap-repo-ci`): thêm `ci.yml` mẫu và `nexagnet-claude-reviewer.yml` (ghim SHA của `.github`). File nào repo đã có thì **bỏ qua, không ghi đè**. `ci.yml` mẫu có hai job `test` và `lint` **cố ý đỏ** cho tới khi bạn thay bước TODO bằng lệnh thật, để tránh "CI xanh giả". PR chạm `.github/**` nên chủ repo duyệt và merge tay.
 4. **Ruleset `main-protection`**: bắt buộc PR, chặn xóa và force-push, bắt buộc các check trong `--checks`, 0 approval, không bypass, chỉ cho squash. **Hoãn** nếu nhánh mặc định chưa có `.github/workflows/ci.yml` (bật sớm sẽ khóa chính PR bootstrap vì check chưa bao giờ chạy). Merge PR ở bước 3 rồi **chạy lại cùng lệnh** để bật.
 
 Tên check trong ruleset là **tên job** (ví dụ `domain-tests`), không phải tên workflow `ci`. Đổi tên job trong `ci.yml` thì phải cập nhật `--checks` và chạy lại.
 
-## Bot tự merge (`--with-merge-bot`, mặc định TẮT)
+## Bot tự merge (mặc định BẬT khi `.github` đã có workflow)
 
-Bot merge nên nằm trong cùng lệnh khởi tạo để repo mới không phải cấu hình lại. Nhưng workflow bot merge (PR 4, lấy logic từ PR #12) **chưa được merge** ở `.github`, nên tùy chọn hiện **từ chối** (không ghi gì) cho tới khi `claude-autonomy.yml` tồn tại; khi PR bot merge vào, script được thêm mẫu caller và tùy chọn này chuyển thành bật mặc định.
+Script thêm caller `nexagnet-claude-autonomy.yml` (ghim cùng SHA với Reviewer) khi SHA ghim đã chứa `claude-autonomy.yml`; chưa có thì in lưu ý và bỏ qua (dùng `--with-merge-bot` để bắt buộc, sẽ từ chối trước mọi thao tác ghi nếu chưa có; `--no-merge-bot` để tắt). Dùng `--sensitive-regex RE` cho đường dẫn nhạy cảm riêng của dự án.
 
-Cấp GitHub App cho repo (chỉ chủ làm được, script không đặt secret): tạo một GitHub App merge riêng (Contents và Pull requests: write), cài vào các repo cần, và đặt secret `AUTONOMY_MERGE_APP_ID`, `AUTONOMY_MERGE_APP_PRIVATE_KEY`. Để repo mới khỏi cấu hình lại: cài App ở chế độ "All repositories" của tổ chức (hoặc thêm repo mới vào danh sách) và đặt hai secret ở **cấp tổ chức** với phạm vi các repo được chọn. Ruleset `main-protection` không có bypass, bot merge đi qua đúng luật như người.
+Chi tiết quy tắc, ma trận ca và **hướng dẫn tạo GitHub App** (chỉ chủ làm được, script không đặt secret): xem `central-claude-autonomy.md`. Tóm tắt: App chỉ cần Contents và Pull requests: write, cài vào tổ chức (All repositories), secret `AUTONOMY_MERGE_APP_ID`/`AUTONOMY_MERGE_APP_PRIVATE_KEY` đặt ở cấp tổ chức. Ruleset `main-protection` không có bypass; bot đi qua đúng luật như người. Chưa có ruleset thì bot từ chối (đỏ).
 
 ## Ruleset cấp tổ chức (tách riêng)
 
@@ -49,7 +49,7 @@ Nếu gói tổ chức hỗ trợ và đã có ruleset cấp tổ chức khớp 
 
 Secret `CLAUDE_CODE_OAUTH_TOKEN` được kế thừa từ tổ chức nên **không cần đặt từng repo** (chủ xác nhận; chưa tự kiểm được vì phiên không đọc được secret). Nếu secret tổ chức chỉ áp cho "repo được chọn" thì repo mới phải được thêm vào danh sách đó. Bước thử Reviewer thật trên PR mẫu sẽ xác nhận.
 
-Việc còn lại chỉ chủ làm được: chạy `--apply` (phiên Claude không tự chạy lên repo thật), bảo đảm Actions cho phép dùng workflow reusable từ `nexagnet/.github`, và tạo GitHub App merge khi bật bot tự merge (chưa làm).
+Việc còn lại chỉ chủ làm được: chạy `--apply` (phiên Claude không tự chạy lên repo thật), bảo đảm Actions cho phép dùng workflow reusable từ `nexagnet/.github`, và tạo GitHub App merge cùng secret tổ chức khi dùng bot tự merge (chưa làm).
 
 ## Kiểm chứng
 

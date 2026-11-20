@@ -1,0 +1,31 @@
+name: Nexagnet Autonomy caller
+
+# Bot tự merge dùng chung (quy tắc xác định, không AI). Chạy sau khi Reviewer xong.
+# Chỉ merge khi: Reviewer PASS đúng HEAD, ci xanh, PR Ready, không có nhãn needs-human,
+# ruleset main hiệu lực, và PR không chạm đường dẫn nhạy cảm. Ngược lại: không merge.
+# Cần secret AUTONOMY_MERGE_APP_ID và AUTONOMY_MERGE_APP_PRIVATE_KEY (xem docs/engineering/central-claude-autonomy.md).
+# Ghim SHA 40 ký tự đã duyệt của .github; nâng cấp bằng PR do chủ duyệt.
+on:
+  workflow_run:
+    workflows: [Nexagnet Reviewer caller]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  autonomy:
+    if: github.event.workflow_run.conclusion == 'success'
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+      issues: write
+    uses: nexagnet/.github/.github/workflows/claude-autonomy.yml@__PIN_SHA__
+    with:
+      reviewer_run_id: ${{ github.event.workflow_run.id }}
+      required_jobs_csv: __CHECKS_CSV__
+      trusted_authors_csv: __AUTHORS_CSV__
+      sensitive_paths_regex: '__SENSITIVE_REGEX__'
+    secrets:
+      AUTONOMY_MERGE_APP_ID: ${{ secrets.AUTONOMY_MERGE_APP_ID }}
+      AUTONOMY_MERGE_APP_PRIVATE_KEY: ${{ secrets.AUTONOMY_MERGE_APP_PRIVATE_KEY }}

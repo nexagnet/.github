@@ -4,7 +4,8 @@
 #   scripts/bootstrap-repo.sh OWNER/REPO [tùy chọn]          # chỉ IN kế hoạch (dry-run, chỉ đọc)
 #   scripts/bootstrap-repo.sh OWNER/REPO --apply [tùy chọn]  # thực hiện
 #   scripts/bootstrap-repo.sh --check-org OWNER              # chỉ đọc: gói tổ chức và ruleset cấp tổ chức
-#   --with-merge-bot  (mặc định TẮT) thêm caller bot merge; từ chối cho tới khi workflow bot merge có ở .github
+#   --no-merge-bot    không thêm caller bot merge (mặc định BẬT khi .github đã có claude-autonomy.yml)
+#   --sensitive-regex RE  đường dẫn nhạy cảm riêng của dự án: PR chạm vào chỉ nhận READY_FOR_MANUAL_MERGE
 #
 # Việc làm (theo thứ tự):
 #   1. Nhãn `needs-human` (PR có nhãn này thì bot KHÔNG tự merge).
@@ -52,7 +53,7 @@ fi
 repo="${1:-}"; [[ "$repo" == "-h" || "$repo" == "--help" ]] && usage 0
 [[ "$repo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || usage 2
 shift
-apply=0 skip_labels=0 skip_settings=0 skip_files=0 skip_ruleset=0 with_merge_bot=0
+apply=0 skip_labels=0 skip_settings=0 skip_files=0 skip_ruleset=0 with_merge_bot=1 merge_bot_explicit=0 sensitive_regex=""
 checks="test,lint" authors="" ignore_regex="" pin_sha=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -61,7 +62,9 @@ while [[ $# -gt 0 ]]; do
     --skip-settings) skip_settings=1 ;;
     --skip-files) skip_files=1 ;;
     --skip-ruleset) skip_ruleset=1 ;;
-    --with-merge-bot) with_merge_bot=1 ;;
+    --with-merge-bot) with_merge_bot=1; merge_bot_explicit=1 ;;
+    --no-merge-bot) with_merge_bot=0 ;;
+    --sensitive-regex) sensitive_regex="${2:?}"; shift ;;
     --checks) checks="${2:?}"; shift ;;
     --authors) authors="${2:?}"; shift ;;
     --ignore-regex) ignore_regex="${2:?}"; shift ;;
@@ -73,17 +76,29 @@ while [[ $# -gt 0 ]]; do
 done
 [[ "$checks" =~ ^[a-zA-Z][a-zA-Z0-9_-]{1,63}(,[a-zA-Z][a-zA-Z0-9_-]{1,63})+$ ]] \
   || die "--checks cần ít nhất 2 tên job hợp lệ, cách nhau bằng dấu phẩy (Reviewer yêu cầu)"
-[[ -z "$ignore_regex" || ( ${#ignore_regex} -le 200 && "$ignore_regex" != *"'"* ) ]] || die "--ignore-regex quá dài hoặc chứa dấu '"
+[[ -z "$ignore_regex" || ( ${#ignore_regex} -le 200 && "$ignore_regex" != *"'"* && "$ignore_regex" != *"#"* ) ]] || die "--ignore-regex quá dài hoặc chứa dấu ' hay #"
 [[ -z "$pin_sha" || "$pin_sha" =~ ^[0-9a-f]{40}$ ]] || die "--pin-sha phải là SHA 40 ký tự"
 [[ -z "$authors" || "$authors" =~ ^[A-Za-z0-9-]+(,[A-Za-z0-9-]+)*$ ]] || die "--authors không hợp lệ"
 
-# Bot merge: mặc định TẮT. Chỉ cho bật khi workflow merge đã tồn tại ở repo trung tâm.
-# Kiểm trước mọi thao tác ghi để không để lại repo ở trạng thái dở dang.
-if [[ $with_merge_bot -eq 1 ]]; then
-  if ! gh api "repos/$CENTRAL_REPO/contents/.github/workflows/claude-autonomy.yml" >/dev/null 2>&1; then
-    die "--with-merge-bot chưa dùng được: $CENTRAL_REPO chưa có .github/workflows/claude-autonomy.yml (PR bot merge chưa được merge). Không có gì bị thay đổi."
+[[ -z "$sensitive_regex" || ( ${#sensitive_regex} -le 200 && "$sensitive_regex" != *"'"* && "$sensitive_regex" != *"#"* ) ]] \
+  || die "--sensitive-regex quá dài hoặc chứa dấu ' hay #"
+
+# Đọc trước (chỉ đọc) để mọi lỗi cấu hình xảy ra TRƯỚC khi ghi bất cứ gì.
+if [[ $skip_files -eq 0 ]]; then
+  [[ -n "$authors" ]] || authors="$(gh api user --jq .login)"
+  [[ "$authors" =~ ^[A-Za-z0-9-]+(,[A-Za-z0-9-]+)*$ ]] || die "--authors không hợp lệ"
+  if [[ -z "$pin_sha" ]]; then
+    pin_sha="$(gh api "repos/$CENTRAL_REPO/commits/$(gh api "repos/$CENTRAL_REPO" --jq .default_branch)" --jq .sha)"
   fi
-  die "--with-merge-bot: workflow đã có nhưng script chưa có mẫu caller tương ứng; cập nhật script cùng PR bot merge."
+  [[ "$pin_sha" =~ ^[0-9a-f]{40}$ ]] || die "không xác định được SHA của $CENTRAL_REPO"
+  # Bot merge chỉ thêm khi SHA được ghim đã chứa workflow bot merge (nếu không, caller sẽ hỏng).
+  if [[ $with_merge_bot -eq 1 ]] \
+     && ! gh api "repos/$CENTRAL_REPO/contents/.github/workflows/claude-autonomy.yml?ref=$pin_sha" >/dev/null 2>&1; then
+    [[ $merge_bot_explicit -eq 0 ]] \
+      || die "--with-merge-bot: $CENTRAL_REPO@$pin_sha chưa có claude-autonomy.yml. Không có gì bị thay đổi."
+    echo "Lưu ý: $CENTRAL_REPO@$pin_sha chưa có claude-autonomy.yml nên bỏ qua caller bot merge."
+    with_merge_bot=0
+  fi
 fi
 
 mode="DRY-RUN (chỉ đọc; thêm --apply để thực hiện)"; [[ $apply -eq 1 ]] && mode="APPLY"
@@ -127,22 +142,20 @@ if get "repos/$repo/contents/.github/workflows/ci.yml?ref=$default_branch" >/dev
 
 if [[ $skip_files -eq 0 ]]; then
   echo "[3/4] PR thêm ci.yml mẫu và caller Reviewer"
-  [[ -n "$authors" ]] || authors="$(get user --jq .login)"
-  [[ "$authors" =~ ^[A-Za-z0-9-]+(,[A-Za-z0-9-]+)*$ ]] || die "--authors không hợp lệ"
-  if [[ -z "$pin_sha" ]]; then
-    pin_sha="$(get "repos/$CENTRAL_REPO/commits/$(get "repos/$CENTRAL_REPO" --jq .default_branch)" --jq .sha)"
-  fi
-  [[ "$pin_sha" =~ ^[0-9a-f]{40}$ ]] || die "không xác định được SHA của $CENTRAL_REPO"
-  echo "  Ghim $CENTRAL_REPO@$pin_sha ; tác giả tin cậy: $authors ; check bắt buộc: $checks"
+  echo "  Ghim $CENTRAL_REPO@$pin_sha ; tác giả tin cậy: $authors ; check bắt buộc: $checks ; bot merge: $([[ $with_merge_bot -eq 1 ]] && echo bật || echo tắt)"
 
   render() { # render <template> -> stdout
     sed -e "s#__PIN_SHA__#$pin_sha#g" -e "s#__CHECKS_CSV__#$checks#g" \
-        -e "s#__AUTHORS_CSV__#$authors#g" -e "s#__IGNORE_REGEX__#${ignore_regex//\\/\\\\}#g" "$1"
+        -e "s#__AUTHORS_CSV__#$authors#g" -e "s#__IGNORE_REGEX__#${ignore_regex//\\/\\\\}#g" \
+        -e "s#__SENSITIVE_REGEX__#${sensitive_regex//\\/\\\\}#g" "$1"
   }
   declare -A want=( [".github/workflows/ci.yml"]="$TEMPLATE_DIR/ci.yml"
-                    [".github/workflows/nexagnet-claude-reviewer.yml"]="$TEMPLATE_DIR/nexagnet-claude-reviewer.yml" )
+                    [".github/workflows/nexagnet-claude-reviewer.yml"]="$TEMPLATE_DIR/nexagnet-claude-reviewer.yml"
+                    [".github/workflows/nexagnet-claude-autonomy.yml"]="$TEMPLATE_DIR/nexagnet-claude-autonomy.yml" )
+  wanted=(".github/workflows/ci.yml" ".github/workflows/nexagnet-claude-reviewer.yml")
+  [[ $with_merge_bot -eq 1 ]] && wanted+=(".github/workflows/nexagnet-claude-autonomy.yml")
   missing=()
-  for path in ".github/workflows/ci.yml" ".github/workflows/nexagnet-claude-reviewer.yml"; do
+  for path in "${wanted[@]}"; do
     if get "repos/$repo/contents/$path?ref=$default_branch" >/dev/null 2>&1; then
       echo "  Bỏ qua (đã có): $path"
     else
@@ -172,7 +185,7 @@ if [[ $skip_files -eq 0 ]]; then
         echo "  SẼ LÀM: thêm $path vào nhánh $BRANCH_NAME"
       fi
     done
-    body=$'Thêm CI mẫu và caller Reviewer dùng chung (bootstrap).\n\n- `ci.yml` mẫu **cố ý đỏ**: thay các bước TODO bằng lệnh build/test/lint thật rồi mới merge.\n- Caller Reviewer ghim `'"$CENTRAL_REPO@$pin_sha"$'`; cần secret `CLAUDE_CODE_OAUTH_TOKEN` của repo.\n- Sau khi merge, chạy lại `scripts/bootstrap-repo.sh '"$repo"$' --apply` để bật ruleset `main-protection`.\n\nPR chạm `.github/**` nên chủ repo duyệt và merge tay.'
+    body=$'Thêm CI mẫu và caller Reviewer dùng chung (bootstrap).\n\n- `ci.yml` mẫu **cố ý đỏ**: thay các bước TODO bằng lệnh build/test/lint thật rồi mới merge.\n- Caller Reviewer ghim `'"$CENTRAL_REPO@$pin_sha"$'`; cần secret `CLAUDE_CODE_OAUTH_TOKEN` của repo.\n- Nếu có `nexagnet-claude-autonomy.yml`: bot merge cần secret `AUTONOMY_MERGE_APP_ID`/`AUTONOMY_MERGE_APP_PRIVATE_KEY` (GitHub App); thiếu thì bot không merge được.\n- Sau khi merge, chạy lại `scripts/bootstrap-repo.sh '"$repo"$' --apply` để bật ruleset `main-protection`.\n\nPR chạm `.github/**` nên chủ repo duyệt và merge tay.'
     if [[ $apply -eq 1 ]]; then
       jq -n --arg t "ci: bootstrap CI mẫu và caller Reviewer" --arg h "$BRANCH_NAME" --arg b "$default_branch" --arg body "$body" \
         '{title:$t, head:$h, base:$b, body:$body}' | gh api -X POST "repos/$repo/pulls" --input - --jq '"  ĐÃ LÀM: mở PR " + .html_url'

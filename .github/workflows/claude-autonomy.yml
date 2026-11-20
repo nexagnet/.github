@@ -1,0 +1,321 @@
+name: Nexagnet Shared Merge Controller
+
+# Bot tự merge dùng chung. KHÔNG dùng AI: chỉ là mã quy tắc xác định.
+# Chỉ merge khi mọi bằng chứng được kéo lại từ API ngay lúc này đều khớp đúng HEAD.
+# Một controller duy nhất; merge qua API với expected HEAD SHA; không --auto, không bypass.
+on:
+  workflow_call:
+    inputs:
+      reviewer_run_id:
+        description: Run id của "Nexagnet Reviewer caller" vừa hoàn tất (workflow_run.id)
+        type: number
+        required: true
+      required_jobs_csv:
+        description: Tên các job CI bắt buộc (cùng danh sách với Reviewer và ruleset)
+        type: string
+        required: true
+      trusted_authors_csv:
+        description: Login người dùng được phép có PR tự merge (bot Publisher luôn được)
+        type: string
+        default: ''
+      sensitive_paths_regex:
+        description: >-
+          jq regex bổ sung cho đường dẫn nhạy cảm của dự án (ví dụ ProjectSettings/ hay
+          Packages/manifest.json). PR khớp sẽ chỉ nhận READY_FOR_MANUAL_MERGE, không tự merge.
+        type: string
+        default: ''
+    secrets:
+      AUTONOMY_MERGE_APP_ID:
+        required: true
+      AUTONOMY_MERGE_APP_PRIVATE_KEY:
+        required: true
+permissions: {}
+
+# Một merge tại một thời điểm cho mỗi repo; không bao giờ hủy lần đang chạy.
+concurrency:
+  group: nexagnet-autonomy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  decide:
+    name: Quyết định (chỉ đọc)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    outputs:
+      decision: ${{ steps.policy.outputs.decision }}
+      reason: ${{ steps.policy.outputs.reason }}
+      pr: ${{ steps.policy.outputs.pr }}
+      sha: ${{ steps.policy.outputs.sha }}
+      base: ${{ steps.policy.outputs.base }}
+      ci_run: ${{ steps.policy.outputs.ci_run }}
+    steps:
+      - id: policy
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN: ${{ inputs.reviewer_run_id }}
+          REQUIRED: ${{ inputs.required_jobs_csv }}
+          AUTHORS: ${{ inputs.trusted_authors_csv }}
+          EXTRA_SENSITIVE: ${{ inputs.sensitive_paths_regex }}
+        run: |
+          set -euo pipefail
+          # Chỉ in mã lý do cố định, không bao giờ in nội dung API/PR/đường dẫn.
+          reason=INPUTS
+          gate_exit() {
+            status=$?
+            trap - EXIT
+            if [ "$status" -ne 0 ]; then
+              printf '::error::AUTONOMY_BLOCKED: %s. Không merge.\n' "$reason"
+              if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+                # shellcheck disable=SC2016
+                printf '### Merge controller dừng\n\nLý do: `%s`\n\nKhông có merge nào được thực hiện.\n' "$reason" >> "$GITHUB_STEP_SUMMARY" || true
+              fi
+            fi
+            exit "$status"
+          }
+          trap gate_exit EXIT
+          exec 2>/dev/null
+          none() { # none <mã>: trạng thái bình thường, không merge, không đỏ
+            { echo "decision=NONE"; echo "reason=$1"; } >> "$GITHUB_OUTPUT"
+            printf '::notice::AUTONOMY_NO_ACTION: %s\n' "$1"
+            trap - EXIT
+            exit 0
+          }
+          test "$GITHUB_REPOSITORY_OWNER" = nexagnet
+          test "$GITHUB_REPOSITORY" != nexagnet/.github
+          test "$GITHUB_EVENT_NAME" = workflow_run
+          [[ "$RUN" =~ ^[1-9][0-9]*$ ]]
+          [[ "$REQUIRED" =~ ^[a-zA-Z][a-zA-Z0-9_-]{1,63}(,[a-zA-Z][a-zA-Z0-9_-]{1,63})+$ ]]
+          [[ -z "$AUTHORS" || "$AUTHORS" =~ ^[A-Za-z0-9-]+(,[A-Za-z0-9-]+)*$ ]]
+          test "${#EXTRA_SENSITIVE}" -le 300
+          test -z "$(printf '%s' "$EXTRA_SENSITIVE" | tr -d '[:print:]')"
+          reason=SOURCE_EVENT
+          jq -e --argjson id "$RUN" '
+            .action == "completed" and .workflow_run.id == $id
+            and .workflow_run.conclusion == "success"
+          ' "$GITHUB_EVENT_PATH" >/dev/null
+          reason=API_BASE
+          base="$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)"
+          reason=REVIEW_RUN
+          review_run="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN")"
+          jq -e --arg repo "$GITHUB_REPOSITORY" --arg base "$base" '
+            .name == "Nexagnet Reviewer caller"
+            and .path == ".github/workflows/nexagnet-claude-reviewer.yml"
+            and .event == "workflow_run" and .status == "completed"
+            and .conclusion == "success" and .repository.full_name == $repo
+            and .head_branch == $base
+          ' <<< "$review_run" >/dev/null
+          # Bằng chứng chỉ do job report của Reviewer (mã từ nhánh mặc định) tạo ra.
+          # Không có bằng chứng (Draft, lỗi AI...) là bình thường: không làm gì, không merge.
+          dir="$RUNNER_TEMP/evidence"
+          mkdir -p "$dir"
+          gh run download "$RUN" -n nexagnet-review-evidence -D "$dir" --repo "$GITHUB_REPOSITORY" || none NO_EVIDENCE
+          evidence="$dir/review-evidence.json"
+          reason=EVIDENCE
+          test -f "$evidence"
+          test "$(wc -c < "$evidence")" -le 30000
+          jq -e '
+            .schema == "nexagnet-review-v1"
+            and (.pr | type == "number" and . >= 1 and . == floor)
+            and (.head_sha | type == "string" and test("^[0-9a-f]{40}$"))
+            and (.ci_run_id | type == "number" and . >= 1 and . == floor)
+            and (.review.head_sha == .head_sha)
+            and (.review.verdict | IN("PASS", "REQUEST_CHANGES"))
+          ' "$evidence" >/dev/null
+          pr_num="$(jq -r .pr "$evidence")"
+          sha="$(jq -r .head_sha "$evidence")"
+          ci_id="$(jq -r .ci_run_id "$evidence")"
+          [ "$(jq -r .review.verdict "$evidence")" = PASS ] || none NOT_PASS
+          jq -e '.review.diff_inspected == true
+            and ([.review.findings[] | select(.severity == "blocker" or .severity == "major")] | length == 0)
+          ' "$evidence" >/dev/null
+          reason=API_PR
+          pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr_num")"
+          # PASS cũ không dùng cho HEAD mới (ca 10); PR đã đóng/merge rồi (ca 16) cũng không làm gì.
+          jq -e --arg sha "$sha" '.state == "open" and .merged == false and .head.sha == $sha' <<< "$pr" >/dev/null || none STALE_OR_CLOSED
+          reason=PR_IDENTITY
+          jq -e --arg repo "$GITHUB_REPOSITORY" --arg base "$base" '
+            .head.repo.full_name == $repo and .base.repo.full_name == $repo and .base.ref == $base
+          ' <<< "$pr" >/dev/null
+          reason=PR_AUTHOR
+          jq -e --arg authors "$AUTHORS" '
+            (.user.login == "nexagnet-builder-publisher[bot]" and .user.type == "Bot")
+            or (.user.type == "User"
+                and (.user.login as $l | (($authors | split(",")) | index($l)) != null))
+          ' <<< "$pr" >/dev/null
+          jq -e '.draft == false' <<< "$pr" >/dev/null || none DRAFT
+          jq -e '[.labels[].name] | index("needs-human") == null' <<< "$pr" >/dev/null || none NEEDS_HUMAN
+          reason=API_CI_RUN
+          ci="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$ci_id")"
+          reason=CI_RUN
+          jq -e --arg sha "$sha" --arg repo "$GITHUB_REPOSITORY" --argjson pr "$pr_num" '
+            .name == "ci" and .path == ".github/workflows/ci.yml"
+            and .status == "completed" and .conclusion == "success"
+            and .event == "pull_request" and .head_sha == $sha
+            and .repository.full_name == $repo
+            and ([.pull_requests[]?.number] | length == 1 and .[0] == $pr)
+          ' <<< "$ci" >/dev/null
+          reason=API_CI_LATEST
+          latest="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$sha&event=pull_request&per_page=10")"
+          reason=CI_LATEST
+          # Có lần chạy ci mới hơn trên cùng HEAD: đợi bằng chứng mới, không merge theo cái cũ.
+          jq -e --argjson id "$ci_id" '.workflow_runs | length > 0 and .[0].id == $id' <<< "$latest" >/dev/null || none CI_SUPERSEDED
+          reason=API_CI_JOBS
+          jobs="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$ci_id/jobs?per_page=100")"
+          reason=CI_JOBS
+          test "$(jq -r .total_count <<< "$jobs")" -le 100
+          for name in $(tr ',' ' ' <<< "$REQUIRED"); do
+            jq -e --arg n "$name" '[.jobs[] |
+              select(.name == $n and .status == "completed" and .conclusion == "success")] |
+              length == 1' <<< "$jobs" >/dev/null
+          done
+          # Ca 20: chưa bật ruleset hiệu lực trên nhánh đích thì từ chối (đỏ, để chủ thấy cấu hình thiếu).
+          reason=API_RULES
+          rules="$(gh api "repos/$GITHUB_REPOSITORY/rules/branches/$base?per_page=100")"
+          reason=RULESET_MISSING
+          jq -e --arg req "$REQUIRED" '
+            type == "array" and length > 0 and length < 100
+            and all(.[]; .type != "merge_queue")
+            and any(.[]; .type == "pull_request")
+            and ([.[] | select(.type == "required_status_checks")
+                  | .parameters.required_status_checks[].context] as $c
+                 | ($req | split(",") | all(. as $n | $c | index($n) != null)))
+          ' <<< "$rules" >/dev/null
+          reason=API_FILES
+          files="$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$pr_num/files?per_page=100" --jq '.[]' | jq -s '.')"
+          reason=FILES
+          test "$(jq length <<< "$files")" -lt 3000
+          decision=MERGE
+          sens='(^|/)(\.github|\.claude)/|^infra/|^deploy/|^tools/autopilot/|(^|/)(agents\.md|claude\.md|\.mcp\.json|\.env(\..*)?)$'
+          if jq -e --arg sens "$sens" --arg extra "$EXTRA_SENSITIVE" '
+              any(.[]; [.filename, (.previous_filename // empty)][]
+                | ((ascii_downcase | test($sens)) or ($extra != "" and test($extra))))
+            ' <<< "$files" >/dev/null; then
+            decision=MANUAL
+            outcome_reason=SENSITIVE_PATH
+          else
+            outcome_reason=ELIGIBLE
+          fi
+          reason=OUTPUTS
+          {
+            echo "decision=$decision"
+            echo "reason=$outcome_reason"
+            echo "pr=$pr_num"
+            echo "sha=$sha"
+            echo "base=$base"
+            echo "ci_run=$ci_id"
+          } >> "$GITHUB_OUTPUT"
+
+  merge:
+    name: Merge đúng HEAD (token App chỉ tạo sau khi kiểm lại)
+    needs: decide
+    if: needs.decide.outputs.decision == 'MERGE'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    steps:
+      - id: recheck
+        name: Kéo lại trạng thái ngay trước khi merge
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ needs.decide.outputs.pr }}
+          SHA: ${{ needs.decide.outputs.sha }}
+          BASE: ${{ needs.decide.outputs.base }}
+          CI_RUN: ${{ needs.decide.outputs.ci_run }}
+          REQUIRED: ${{ inputs.required_jobs_csv }}
+        run: |
+          set -euo pipefail
+          exec 2>/dev/null
+          reason=RECHECK
+          trap 'status=$?; if [ "$status" -ne 0 ]; then printf "::error::AUTONOMY_BLOCKED: %s. Không merge.\n" "$reason"; fi; exit "$status"' EXIT
+          test "$GITHUB_REPOSITORY_OWNER" = nexagnet
+          test "$GITHUB_REPOSITORY" != nexagnet/.github
+          [[ "$PR" =~ ^[1-9][0-9]*$ && "$SHA" =~ ^[0-9a-f]{40}$ && "$CI_RUN" =~ ^[1-9][0-9]*$ ]]
+          pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR")"
+          jq -e --arg sha "$SHA" --arg base "$BASE" --arg repo "$GITHUB_REPOSITORY" '
+            .state == "open" and .merged == false and .draft == false
+            and .head.sha == $sha and .base.ref == $base
+            and .head.repo.full_name == $repo and .base.repo.full_name == $repo
+            and ([.labels[].name] | index("needs-human") == null)
+          ' <<< "$pr" >/dev/null
+          reason=RECHECK_CI
+          latest="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$SHA&event=pull_request&per_page=10")"
+          jq -e --argjson id "$CI_RUN" '.workflow_runs | length > 0 and .[0].id == $id
+            and .[0].status == "completed" and .[0].conclusion == "success"' <<< "$latest" >/dev/null
+          reason=RECHECK_RULES
+          rules="$(gh api "repos/$GITHUB_REPOSITORY/rules/branches/$BASE?per_page=100")"
+          jq -e --arg req "$REQUIRED" '
+            type == "array" and length > 0 and length < 100
+            and all(.[]; .type != "merge_queue")
+            and any(.[]; .type == "pull_request")
+            and ([.[] | select(.type == "required_status_checks")
+                  | .parameters.required_status_checks[].context] as $c
+                 | ($req | split(",") | all(. as $n | $c | index($n) != null)))
+          ' <<< "$rules" >/dev/null
+      - id: app_token
+        name: Tạo token App merge (chỉ repo này, quyền tối thiểu)
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          app-id: ${{ secrets.AUTONOMY_MERGE_APP_ID }}
+          private-key: ${{ secrets.AUTONOMY_MERGE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Merge squash với expected HEAD SHA (một lần, không retry, không bypass)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          PR: ${{ needs.decide.outputs.pr }}
+          SHA: ${{ needs.decide.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # API từ chối (HTTP 409) nếu HEAD của PR khác $SHA: nhánh lỗi thời hay commit mới ⇒ dừng.
+          if ! out="$(gh api -X PUT "repos/$GITHUB_REPOSITORY/pulls/$PR/merge" \
+                -f sha="$SHA" -f merge_method=squash 2>&1)"; then
+            code="$(grep -Eo 'HTTP [0-9]{3}' <<< "$out" | head -1 || true)"
+            printf '::error::AUTO_MERGE_STOPPED: GitHub từ chối merge (%s). Không retry, không bypass.\n' "${code:-HTTP ?}"
+            exit 1
+          fi
+          # Không tin mã thoát: kéo lại để xác nhận thật sự đã merge.
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq '.merged == true' | grep -qx true
+          echo "Đã merge PR #$PR tại HEAD $SHA (xác nhận qua API). Cần kiểm tra thêm ci trên main."
+
+  notify:
+    name: Thông báo (READY_FOR_MANUAL_MERGE / dừng merge)
+    needs: [decide, merge]
+    if: always() && (needs.decide.outputs.decision == 'MANUAL' || needs.merge.result == 'failure')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Đăng một comment cố định cho mỗi HEAD (không lặp)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ needs.decide.outputs.pr }}
+          SHA: ${{ needs.decide.outputs.sha }}
+          DECISION: ${{ needs.decide.outputs.decision }}
+          REASON: ${{ needs.decide.outputs.reason }}
+        run: |
+          set -euo pipefail
+          [[ "$PR" =~ ^[1-9][0-9]*$ && "$SHA" =~ ^[0-9a-f]{40}$ ]]
+          if [ "$DECISION" = MANUAL ]; then
+            body="READY_FOR_MANUAL_MERGE HEAD_SHA=$SHA REASON=SENSITIVE_PATH"
+          else
+            body="AUTO_MERGE_STOPPED HEAD_SHA=$SHA (merge tự động bị từ chối hoặc không xác nhận được; xem log của run, cần chủ xử lý)"
+          fi
+          existing="$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments?per_page=100" --jq '.[].body' | grep -cxF "$body" || true)"
+          if [ "$existing" = 0 ]; then
+            jq -n --arg b "$body" '{body:$b}' | gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --input - --jq .html_url
+          fi
