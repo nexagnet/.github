@@ -42,6 +42,7 @@ let m;
 if (route === 'user') out({ login: state.user });
 else if (path === 'repos/nexagnet/.github') out({ default_branch: 'main' });
 else if (path === 'repos/nexagnet/.github/commits/main') out({ sha: 'd'.repeat(40) });
+else if (path.startsWith('repos/nexagnet/.github/contents/')) { (state.central || []).includes(path.split('/contents/')[1]) ? out({}) : notFound(); }
 else if (path.startsWith('orgs/')) { process.stderr.write('gh: forbidden (HTTP 403)\n'); process.exit(1); }
 else if (path === base && method === 'GET') out({ default_branch: 'main' });
 else if (path === base && method === 'PATCH') { state.settings = fields; save(); out({}); }

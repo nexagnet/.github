@@ -21,6 +21,12 @@ Cần `gh` đăng nhập bằng tài khoản có **quyền admin repo**, cùng `
 
 Tên check trong ruleset là **tên job** (ví dụ `domain-tests`), không phải tên workflow `ci`. Đổi tên job trong `ci.yml` thì phải cập nhật `--checks` và chạy lại.
 
+## Bot tự merge (`--with-merge-bot`, mặc định TẮT)
+
+Bot merge nên nằm trong cùng lệnh khởi tạo để repo mới không phải cấu hình lại. Nhưng workflow bot merge (PR 4, lấy logic từ PR #12) **chưa được merge** ở `.github`, nên tùy chọn hiện **từ chối** (không ghi gì) cho tới khi `claude-autonomy.yml` tồn tại; khi PR bot merge vào, script được thêm mẫu caller và tùy chọn này chuyển thành bật mặc định.
+
+Cấp GitHub App cho repo (chỉ chủ làm được, script không đặt secret): tạo một GitHub App merge riêng (Contents và Pull requests: write), cài vào các repo cần, và đặt secret `AUTONOMY_MERGE_APP_ID`, `AUTONOMY_MERGE_APP_PRIVATE_KEY`. Để repo mới khỏi cấu hình lại: cài App ở chế độ "All repositories" của tổ chức (hoặc thêm repo mới vào danh sách) và đặt hai secret ở **cấp tổ chức** với phạm vi các repo được chọn. Ruleset `main-protection` không có bypass, bot merge đi qua đúng luật như người.
+
 ## Ruleset cấp tổ chức (tách riêng)
 
 Ruleset áp cho cả tổ chức thì không cần tạo từng repo. Kiểm bằng lệnh chỉ đọc (cần quyền owner của tổ chức, phiên Claude không đọc được):

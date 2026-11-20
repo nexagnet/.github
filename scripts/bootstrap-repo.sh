@@ -4,6 +4,7 @@
 #   scripts/bootstrap-repo.sh OWNER/REPO [tùy chọn]          # chỉ IN kế hoạch (dry-run, chỉ đọc)
 #   scripts/bootstrap-repo.sh OWNER/REPO --apply [tùy chọn]  # thực hiện
 #   scripts/bootstrap-repo.sh --check-org OWNER              # chỉ đọc: gói tổ chức và ruleset cấp tổ chức
+#   --with-merge-bot  (mặc định TẮT) thêm caller bot merge; từ chối cho tới khi workflow bot merge có ở .github
 #
 # Việc làm (theo thứ tự):
 #   1. Nhãn `needs-human` (PR có nhãn này thì bot KHÔNG tự merge).
@@ -51,7 +52,7 @@ fi
 repo="${1:-}"; [[ "$repo" == "-h" || "$repo" == "--help" ]] && usage 0
 [[ "$repo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || usage 2
 shift
-apply=0 skip_labels=0 skip_settings=0 skip_files=0 skip_ruleset=0
+apply=0 skip_labels=0 skip_settings=0 skip_files=0 skip_ruleset=0 with_merge_bot=0
 checks="test,lint" authors="" ignore_regex="" pin_sha=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -60,6 +61,7 @@ while [[ $# -gt 0 ]]; do
     --skip-settings) skip_settings=1 ;;
     --skip-files) skip_files=1 ;;
     --skip-ruleset) skip_ruleset=1 ;;
+    --with-merge-bot) with_merge_bot=1 ;;
     --checks) checks="${2:?}"; shift ;;
     --authors) authors="${2:?}"; shift ;;
     --ignore-regex) ignore_regex="${2:?}"; shift ;;
@@ -74,6 +76,15 @@ done
 [[ -z "$ignore_regex" || ( ${#ignore_regex} -le 200 && "$ignore_regex" != *"'"* ) ]] || die "--ignore-regex quá dài hoặc chứa dấu '"
 [[ -z "$pin_sha" || "$pin_sha" =~ ^[0-9a-f]{40}$ ]] || die "--pin-sha phải là SHA 40 ký tự"
 [[ -z "$authors" || "$authors" =~ ^[A-Za-z0-9-]+(,[A-Za-z0-9-]+)*$ ]] || die "--authors không hợp lệ"
+
+# Bot merge: mặc định TẮT. Chỉ cho bật khi workflow merge đã tồn tại ở repo trung tâm.
+# Kiểm trước mọi thao tác ghi để không để lại repo ở trạng thái dở dang.
+if [[ $with_merge_bot -eq 1 ]]; then
+  if ! gh api "repos/$CENTRAL_REPO/contents/.github/workflows/claude-autonomy.yml" >/dev/null 2>&1; then
+    die "--with-merge-bot chưa dùng được: $CENTRAL_REPO chưa có .github/workflows/claude-autonomy.yml (PR bot merge chưa được merge). Không có gì bị thay đổi."
+  fi
+  die "--with-merge-bot: workflow đã có nhưng script chưa có mẫu caller tương ứng; cập nhật script cùng PR bot merge."
+fi
 
 mode="DRY-RUN (chỉ đọc; thêm --apply để thực hiện)"; [[ $apply -eq 1 ]] && mode="APPLY"
 echo "Repo: $repo | Chế độ: $mode"

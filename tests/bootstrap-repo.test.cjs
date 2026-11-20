@@ -131,3 +131,10 @@ test('ci.yml mẫu hợp lệ cho actionlint-style kiểm tra: tên workflow và
   assert.match(t, /^  lint:$/m);
   assert.match(t, /actions\/checkout@[0-9a-f]{40}/);
 });
+
+test('--with-merge-bot bị từ chối trước mọi thao tác ghi khi chưa có workflow bot merge', () => {
+  const r = run([R, '--apply', '--with-merge-bot']);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /claude-autonomy\.yml/);
+  assert.deepEqual(writes(r.calls), []);
+});
