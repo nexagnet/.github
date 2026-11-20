@@ -46,7 +46,7 @@ function execute(change = x => x, env = {}) {
         "api repos/${repo}/issues/7") cat "$FIXTURES/issue.json" ;;
         "api repos/${repo}/actions/runs/88") cat "$FIXTURES/run.json" ;;
         "api repos/${repo}/actions/runs/88/jobs?per_page=100") cat "$FIXTURES/jobs.json" ;;
-        "api repos/${repo}/pulls/42/files?per_page=100") cat "$FIXTURES/files.json" ;;
+        "api --paginate repos/${repo}/pulls/42/files?per_page=100 --jq .[]") jq -c '.[]' "$FIXTURES/files.json" ;;
         *) echo 'UNEXPECTED_API_CALL' >&2; return 97 ;;
       esac
     }\n`;
@@ -56,7 +56,8 @@ function execute(change = x => x, env = {}) {
       encoding: 'utf8', timeout: 30000, env: {...process.env, FIXTURES: portable, GITHUB_REPOSITORY_OWNER: 'nexagnet',
         GITHUB_REPOSITORY: repo, GITHUB_EVENT_NAME: 'workflow_run', GITHUB_EVENT_PATH: portable + '/event.json',
         GITHUB_OUTPUT: portable + (env.FAIL_OUTPUT === '1' ? '/missing/output' : '/output'), GITHUB_STEP_SUMMARY: portable + '/summary',
-        PR: '42', SHA: sha, RUN: '88', REQUIRED: 'verify,integration', ...env}
+        PR: '42', SHA: sha, RUN: '88', REQUIRED: 'verify,integration',
+        REQUIRE_CONTRACT: 'true', AUTHORS: '', MAX_FILES: '100', IGNORE_RE: '', MAX_DIFF: '500000', ...env}
     });
     assert.ifError(result.error);
     return {...result, output: readFileSync(path.join(dir, 'output'), 'utf8'),
@@ -100,7 +101,7 @@ const cases = [
   ['CI_RUN', x => ({...x, run: {...x.run, pull_requests: [{number: 99}]}})],
   ['CI_JOBS', x => ({...x, jobs: {...x.jobs, jobs: x.jobs.jobs.slice(0, 1)}})],
   ['CI_JOBS', x => ({...x, jobs: {...x.jobs, total_count: 101}})],
-  ['PROTECTED_PATHS', x => ({...x, files: Array.from({length: 100}, () => x.files[0])})],
+  ['PROTECTED_PATHS', x => ({...x, files: Array.from({length: 101}, () => x.files[0])})],
   ['PROTECTED_PATHS', x => ({...x, files: [{filename: '.github/UNTRUSTED_PATH_CANARY.yml'}]})],
   ['BASE_SHA', x => ({...x, pr: {...x.pr, base: {...x.pr.base, sha: 'invalid'}}})],
   ['OUTPUTS', x => x, {FAIL_OUTPUT: '1'}],
@@ -115,7 +116,7 @@ const cases = [
     ['API_ISSUE', `api repos/${repo}/issues/7`],
     ['API_CI_RUN', `api repos/${repo}/actions/runs/88`],
     ['API_CI_JOBS', `api repos/${repo}/actions/runs/88/jobs?per_page=100`],
-    ['API_FILES', `api repos/${repo}/pulls/42/files?per_page=100`]
+    ['API_FILES', `api --paginate repos/${repo}/pulls/42/files?per_page=100 --jq .[]`]
   ].map(([reason, endpoint]) => [reason, x => x, {FAIL_API: endpoint}])
 ];
 for (const [reason, change, env] of cases) test('gate failure reports ' + reason, () => {
@@ -126,4 +127,80 @@ for (const [reason, change, env] of cases) test('gate failure reports ' + reason
   assert.match(result.summary, new RegExp('Reason: `' + reason + '`'));
   assert.doesNotMatch(result.stdout + result.stderr + result.summary, /UNTRUSTED_(BODY|CONTRACT|PATH|API)_CANARY/);
   assert.doesNotMatch(result.stdout + result.summary, /NEXAGNET_REVIEWER PASS|nexagnet-review-v1/);
+});
+
+// ---- Ordinary PR lane (require_task_contract=false) -------------------------------
+const std = {REQUIRE_CONTRACT: 'false', AUTHORS: 'alice,bob'};
+const stdPr = x => ({...x, pr: {...x.pr, body: 'Fix the shop price rounding bug.', draft: false,
+  user: {login: 'alice', type: 'User'}, head: {...x.pr.head, ref: 'feature/any-branch'}}});
+
+test('ordinary lane needs no Issue, contract, risk label, attestation or claude/ branch', () => {
+  const result = execute(x => ({...stdPr(x), comments: [], issue: {}}), std);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.output, /^mode=standard$/m);
+  assert.match(result.output, /^provenance=standard$/m);
+  assert.match(result.output, /^skip=false$/m);
+  assert.match(result.output, /^issue=$/m);
+});
+
+test('ordinary lane accepts the Publisher bot too', () => {
+  const result = execute(x => ({...stdPr(x), pr: {...stdPr(x).pr,
+    user: {login: 'nexagnet-builder-publisher[bot]', type: 'Bot'}}}), std);
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test('ordinary lane skips Draft PRs cleanly without a red gate', () => {
+  const result = execute(x => ({...stdPr(x), pr: {...stdPr(x).pr, draft: true}}), std);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.output.trim(), 'skip=true');
+  assert.equal(result.summary, '');
+});
+
+test('ordinary lane rejects untrusted authors, empty author list and forks', () => {
+  for (const [change, env] of [
+    [x => ({...stdPr(x), pr: {...stdPr(x).pr, user: {login: 'mallory', type: 'User'}}}), std],
+    [x => ({...stdPr(x), pr: {...stdPr(x).pr, user: {login: 'alice', type: 'Bot'}}}), std],
+    [stdPr, {...std, AUTHORS: ''}],
+    [stdPr, {...std, AUTHORS: 'alice;rm'}],
+    [x => ({...stdPr(x), pr: {...stdPr(x).pr, head: {...x.pr.head, repo: {full_name: 'attacker/fork'}}}}), std],
+  ]) {
+    const result = execute(change, env);
+    assert.notEqual(result.status, 0);
+    assert.equal(result.output, '');
+  }
+});
+
+test('ordinary lane still enforces exact-head CI and protected paths', () => {
+  for (const change of [
+    x => ({...stdPr(x), run: {...x.run, head_sha: 'c'.repeat(40)}}),
+    x => ({...stdPr(x), jobs: {...x.jobs, jobs: x.jobs.jobs.slice(0, 1)}}),
+    x => ({...stdPr(x), files: [{filename: 'Assets/a.cs'}, {filename: '.github/workflows/ci.yml'}]}),
+    x => ({...stdPr(x), files: [{filename: 'CLAUDE.md'}]}),
+  ]) {
+    const result = execute(change, std);
+    assert.notEqual(result.status, 0);
+    assert.equal(result.output, '');
+  }
+});
+
+test('file limit is configurable and ignored paths (Unity .meta) are not counted', () => {
+  const files = [...Array.from({length: 150}, (_, i) => ({filename: `Assets/f${i}.cs.meta`})),
+    ...Array.from({length: 20}, (_, i) => ({filename: `Assets/f${i}.cs`}))];
+  const withFiles = x => ({...stdPr(x), files});
+  assert.notEqual(execute(withFiles, std).status, 0, 'counts everything by default');
+  assert.equal(execute(withFiles, {...std, IGNORE_RE: '\\.meta$'}).status, 0);
+  assert.notEqual(execute(withFiles, {...std, IGNORE_RE: '\\.meta$', MAX_FILES: '19'}).status, 0);
+  assert.equal(execute(withFiles, {...std, MAX_FILES: '170'}).status, 0);
+  // Ignored for counting only: a protected path is still rejected.
+  assert.notEqual(execute(x => ({...stdPr(x), files: [{filename: '.github/x.meta'}]}),
+    {...std, IGNORE_RE: '\\.meta$'}).status, 0);
+});
+
+test('caller limits are validated fail-closed', () => {
+  for (const env of [{MAX_FILES: '0'}, {MAX_FILES: '-1'}, {MAX_FILES: 'x'}, {MAX_DIFF: '0'},
+    {MAX_DIFF: '1000001'}, {REQUIRE_CONTRACT: 'yes'}, {IGNORE_RE: 'a'.repeat(201)}]) {
+    const result = execute(stdPr, {...std, ...env});
+    assert.notEqual(result.status, 0, JSON.stringify(env));
+    assert.equal(result.output, '');
+  }
 });
