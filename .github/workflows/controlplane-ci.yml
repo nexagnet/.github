@@ -44,4 +44,4 @@ jobs:
       - name: ShellCheck — bootstrap script
         run: shellcheck -S warning scripts/bootstrap-repo.sh
       - name: Validate YAML and executable trust-boundary tests
-        run: node --test tests/claude-builder-contract.test.cjs tests/claude-reviewer-contract.test.cjs tests/claude-reviewer-gate-diagnostics.test.cjs tests/claude-reviewer-sdk-diagnostics.test.cjs tests/claude-repair-contract.test.cjs tests/claude-sandbox-probe-contract.test.cjs tests/claude-builder-intent-idempotency.test.cjs tests/bootstrap-repo.test.cjs
+        run: node --test tests/claude-builder-contract.test.cjs tests/claude-reviewer-contract.test.cjs tests/claude-reviewer-gate-diagnostics.test.cjs tests/claude-reviewer-sdk-diagnostics.test.cjs tests/claude-repair-contract.test.cjs tests/claude-sandbox-probe-contract.test.cjs tests/claude-builder-intent-idempotency.test.cjs tests/bootstrap-repo.test.cjs tests/claude-autonomy-contract.test.cjs

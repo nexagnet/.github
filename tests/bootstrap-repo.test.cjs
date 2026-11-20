@@ -132,9 +132,50 @@ test('ci.yml mẫu hợp lệ cho actionlint-style kiểm tra: tên workflow và
   assert.match(t, /actions\/checkout@[0-9a-f]{40}/);
 });
 
-test('--with-merge-bot bị từ chối trước mọi thao tác ghi khi chưa có workflow bot merge', () => {
-  const r = run([R, '--apply', '--with-merge-bot']);
+const WF = '.github/workflows/claude-autonomy.yml';
+const AUTO = 'claude/bootstrap-repo-ci:.github/workflows/nexagnet-claude-autonomy.yml';
+
+test('chưa có claude-autonomy.yml ở .github: mặc định bỏ qua caller bot merge, có thông báo', () => {
+  const r = run([R, '--apply', '--pin-sha', SHA]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.state.files[AUTO], undefined);
+  assert.match(r.stdout, /bỏ qua caller bot merge/);
+});
+
+test('--with-merge-bot tường minh bị từ chối trước mọi thao tác ghi khi chưa có workflow', () => {
+  const r = run([R, '--apply', '--with-merge-bot', '--pin-sha', SHA]);
   assert.notEqual(r.status, 0);
   assert.match(r.stderr, /claude-autonomy\.yml/);
   assert.deepEqual(writes(r.calls), []);
+});
+
+test('đã có workflow bot merge: caller được thêm mặc định, ghim SHA, đủ tham số, không còn placeholder', () => {
+  const r = run([R, '--apply', '--pin-sha', SHA, '--checks', 'domain-tests,meta-check',
+    '--sensitive-regex', '^(ProjectSettings/|Packages/manifest\\.json)'], freshState({ central: [WF] }));
+  assert.equal(r.status, 0, r.stderr);
+  const caller = r.state.files[AUTO];
+  assert.match(caller, new RegExp(`claude-autonomy.yml@${SHA}`));
+  assert.match(caller, /workflows: \[Nexagnet Reviewer caller\]/);
+  assert.match(caller, /required_jobs_csv: domain-tests,meta-check/);
+  assert.match(caller, /trusted_authors_csv: owner-login/);
+  assert.match(caller, /sensitive_paths_regex: '\^\(ProjectSettings\/\|Packages\/manifest\\\.json\)'/);
+  assert.match(caller, /reviewer_run_id: \$\{\{ github\.event\.workflow_run\.id \}\}/);
+  assert.doesNotMatch(caller, /__[A-Z_]+__/);
+  assert.doesNotMatch(caller, /secrets: inherit/);
+});
+
+test('--no-merge-bot không thêm caller dù workflow đã có; sensitive regex xấu bị từ chối', () => {
+  const r = run([R, '--apply', '--pin-sha', SHA, '--no-merge-bot'], freshState({ central: [WF] }));
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.state.files[AUTO], undefined);
+  const bad = run([R, '--apply', '--pin-sha', SHA, '--sensitive-regex', "a'b"], freshState({ central: [WF] }));
+  assert.notEqual(bad.status, 0);
+  assert.deepEqual(writes(bad.calls), []);
+});
+
+test('caller bot merge mẫu: quyền tối thiểu và không có bí mật cứng', () => {
+  const t = readFileSync(path.join(repoRoot, 'templates/repo-bootstrap/nexagnet-claude-autonomy.yml'), 'utf8');
+  assert.match(t, /^permissions: \{\}$/m);
+  assert.match(t, /uses: nexagnet\/\.github\/\.github\/workflows\/claude-autonomy\.yml@__PIN_SHA__/);
+  assert.doesNotMatch(t, /ghp_|github_pat_|BEGIN .*PRIVATE KEY/);
 });
