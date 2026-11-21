@@ -21,6 +21,16 @@ const agent = jobs.agent;
 const publish = jobs.publish;
 const validator = publish.steps.find(s => s.name?.startsWith('Validate patch')).run;
 
+test('non-Bash file tools explicitly deny AWS paths independently of Bash sandbox (#36)', () => {
+  const settings = JSON.parse(agent.steps.find(s => s.id === 'claude').with.settings);
+  assert.ok(settings.sandbox.filesystem.denyRead.includes('~/.aws'));
+  assert.ok(settings.permissions.deny.includes('Read(~/.aws/**)'),
+    'sandbox denyRead alone is not a non-Bash Read permission');
+  for (const path of ['~/.claude/**', '~/.config/gh/**', '~/.ssh/**', '//proc/**']) {
+    assert.ok(settings.permissions.deny.includes(`Read(${path})`));
+  }
+});
+
 test('reusable workflow, restricted author and pinned dependencies', () => {
   assert.ok(caller);
   assert.equal(caller.inputs.issue_number.type, 'number');
