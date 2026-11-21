@@ -49,10 +49,10 @@ function run(messages, options = {}) {
 
 test('failure-only diagnostics preserves hidden output and trusted reporter boundaries', () => {
   assert.ok(code, 'inline diagnostic implementation required');
-  assert.match(block, /if: failure\(\) && steps\.claude\.outcome == 'failure'/);
+  assert.match(block, /!cancelled\(\) && steps\.claude\.outcome == 'failure'/);
   assert.match(block, /shell: node \{0\}/);
   assert.match(block, /EXECUTION_FILE: \$\{\{ steps\.claude\.outputs\.execution_file \}\}/);
-  assert.doesNotMatch(block, /continue-on-error|uses:|GITHUB_OUTPUT|upload-artifact|structured_output:/);
+  assert.doesNotMatch(block, /continue-on-error|uses:|upload-artifact|structured_output:/);
   assert.match(workflow, /show_full_output: 'false'/);
   assert.match(workflow, /if: needs\.review\.result == 'success'/);
   assert.doesNotMatch(code, /console\.error|\.stack|\.message|execSync|spawnSync|fetch\(/);
@@ -134,6 +134,9 @@ test('arbitrary errors, stale quota and conflicting authentication do not select
     [rateEvent(planLimit, 'different session'), blockedResult],
     [rateEvent(planLimit), rateEvent({status: 'allowed'}), blockedResult],
     [rateEvent(planLimit), {...blockedResult, result: 'authentication failed'}],
+    [rateEvent(planLimit), {...blockedResult, result: 'unsupported model'}],
+    [rateEvent(planLimit), {...blockedResult, subtype: 'error_max_turns'}],
+    [rateEvent(planLimit), {...blockedResult, subtype: 'error_max_budget_usd'}],
     [rateEvent(planLimit), {...success, session_id: sessionId}],
   ];
   for (const messages of rejected) assert.equal(run(messages, {fallback: true}).output, '');

@@ -107,17 +107,26 @@ printed or uploaded.
 |---|---|
 | `SDK_AUTH_ERROR_HINT` | Error fields suggest an authentication problem; owner investigates the approved credential path. Do not print or replace secrets automatically. |
 | `SDK_RATE_LIMIT_HINT` | Error fields suggest usage/rate limits; check the account/provider status before another attempt. |
+| `SDK_SUBSCRIPTION_QUOTA_EXHAUSTED` | A typed SDK event from the failed session records a rejected plan window or `credits_required`. |
 | `SDK_MODEL_ERROR_HINT` | Error fields suggest a model availability problem; investigate the pinned configuration without silently switching models. |
 | `SDK_ERROR_UNKNOWN` | SDK reported an error without a recognized category; retain failure and report the limited evidence. |
 | `SDK_OUTPUT_MISSING` | A nonerror terminal result lacks required structured output; inspect the Action/schema contract. |
 | `SDK_DIAGNOSTIC_UNAVAILABLE` | No safe, bounded diagnostic input is available; do not enable raw output to chase it. |
 
-These are advisory hints derived from untrusted SDK fields, not authoritative
-provider diagnoses. They never permit a retry, credential operation, verdict,
-Reporter execution or merge. The failed Claude step remains failed; Reporter
-still requires successful review and its independent revalidation. Keep
+Free-form hints remain advisory. The optional `CLAUDE_CODE_OAUTH_TOKEN_FALLBACK`
+secret enables one additional read-only attempt when the same SDK session has a
+typed subscription rejection. For a plan-window event, the reset time must still
+be in the future. The runner rechecks the open, ready PR and its exact head before
+using the fallback, and discards the previous execution file. Reporter requires
+successful structured output for the same head and still revalidates independently.
+Keep
 `show_full_output: false` and Actions step debugging disabled, because the pinned
 Action enables full output when Actions debugging is enabled.
+
+Provision the authorized second account's `claude setup-token` output as a
+repository Actions secret. Pass it explicitly to the optional workflow secret in
+the consumer caller. A missing secret or a value equal to the primary credential
+leaves the failed review red, while other consumers can omit the optional secret.
 
 Reruns must retain an open PR and the authorized current SHA, valid Task Contract
 and successful exact-head CI. After a consumer pin changes, re-run source CI to
