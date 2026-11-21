@@ -15,6 +15,9 @@ const workflow = JSON.parse(execFileSync('ruby', [
 const jobs = workflow.jobs;
 const preflight = jobs.gate.steps.find(s => s.id === 'verify').run;
 const reviewer = jobs.review.steps.find(s => s.id === 'claude');
+const fallback = jobs.review.steps.find(s => s.id === 'claude_fallback');
+const prompt = jobs.review.env.REVIEW_PROMPT;
+const args = jobs.review.env.REVIEW_ARGS;
 const reporter = jobs.report.steps[0].run;
 
 test('workflow_call interface and no implicit permissions', () => {
@@ -24,6 +27,7 @@ test('workflow_call interface and no implicit permissions', () => {
   assert.equal(caller.inputs.ci_run_id.required, true);
   assert.equal(caller.inputs.required_jobs_csv.required, true);
   assert.equal(caller.secrets.CLAUDE_CODE_OAUTH_TOKEN.required, true);
+  assert.equal(caller.secrets.CLAUDE_CODE_OAUTH_TOKEN_FALLBACK.required, false);
   assert.deepEqual(workflow.permissions, {});
   assert.ok(!source.includes('secrets: inherit'));
 });
@@ -37,9 +41,9 @@ test('reviewer is an independent non-writing agent with exact SHA', () => {
   assert.equal(checkout.with['persist-credentials'], false);
   assert.equal(checkout.with.ref, '\${{ needs.gate.outputs.head }}');
   assert.equal(reviewer.with.github_token, '\${{ github.token }}');
-  assert.match(reviewer.with.claude_args, /--json-schema/);
-  assert.match(reviewer.with.claude_args, /--allowedTools "Read,Glob,Grep"/);
-  assert.match(reviewer.with.claude_args, /--disallowedTools "Bash,Edit,Write,/);
+  assert.match(args, /--json-schema/);
+  assert.match(args, /--allowedTools "Read,Glob,Grep"/);
+  assert.match(args, /--disallowedTools "Bash,Edit,Write,/);
   assert.equal(reviewer.with.show_full_output, 'false');
   assert.ok(!JSON.stringify(jobs.review).includes('BUILDER_PUBLISHER_APP_PRIVATE_KEY'));
 });
@@ -155,12 +159,42 @@ test('trusted Reviewer prepares bounded exact-base-to-head diff before Claude wi
   assert.ok(diff.run.includes('test -s "$RUNNER_TEMP/reviewer-pr-diff.patch"'));
   assert.ok(diff.run.includes('-le "$MAX_DIFF"'));
   assert.equal(diff.env.MAX_DIFF, '${{ inputs.max_diff_bytes }}');
-  assert.ok(reviewer.with.prompt.includes('reviewer-pr-diff.patch'));
-  assert.ok(reviewer.with.prompt.includes('UNTRUSTED data'));
-  assert.ok(reviewer.with.prompt.includes('diff_inspected=false'));
-  assert.doesNotMatch(reviewer.with.claude_args, /Bash\(git /);
-  assert.match(reviewer.with.claude_args, /--disallowedTools "Bash,/);
-  assert.match(reviewer.with.claude_args, /"diff_inspected":\{"type":"boolean"\}/);
+  assert.ok(prompt.includes('reviewer-pr-diff.patch'));
+  assert.ok(prompt.includes('UNTRUSTED data'));
+  assert.ok(prompt.includes('diff_inspected=false'));
+  assert.doesNotMatch(args, /Bash\(git /);
+  assert.match(args, /--disallowedTools "Bash,/);
+  assert.match(args, /"diff_inspected":\{"type":"boolean"\}/);
+});
+
+test('fallback reruns the same read-only Action once behind the typed quota decision and current PR head', () => {
+  const steps = jobs.review.steps;
+  const readiness = steps.find(step => step.id === 'fallback_ready');
+  const diagnose = steps.find(step => step.id === 'diagnose');
+  assert.equal(reviewer['continue-on-error'], true);
+  assert.equal(steps.filter(step => step.uses === reviewer.uses).length, 2);
+  assert.equal(reviewer.with.prompt, '${{ format(env.REVIEW_PROMPT, runner.temp) }}');
+  assert.equal(reviewer.with.claude_args, '${{ env.REVIEW_ARGS }}');
+  assert.deepEqual(fallback.with, {...reviewer.with, claude_code_oauth_token: '${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_FALLBACK }}'});
+  assert.deepEqual(fallback.env, reviewer.env);
+  assert.equal(readiness.if, "steps.diagnose.outputs.use_fallback == 'true'");
+  assert.equal(fallback.if, "steps.fallback_ready.outcome == 'success'");
+  assert.ok(steps.indexOf(reviewer) < steps.indexOf(diagnose));
+  assert.ok(steps.indexOf(diagnose) < steps.indexOf(readiness));
+  assert.ok(steps.indexOf(readiness) < steps.indexOf(fallback));
+  assert.match(readiness.run, /\.head\.sha == \$sha/);
+  assert.match(readiness.run, /\.state == "open" and \.draft == false/);
+  assert.match(readiness.run, /rm -f -- "\$RUNNER_TEMP\/claude-execution-output\.json"/);
+});
+
+test('only a successful exact-head result becomes input to the trusted reporter', () => {
+  const result = jobs.review.steps.find(step => step.id === 'result');
+  assert.equal(jobs.review.outputs.result, '${{ steps.result.outputs.result }}');
+  assert.match(result.env.STRUCTURED_REVIEW, /steps\.claude\.outcome == 'success' && steps\.claude\.outputs\.structured_output/);
+  assert.match(result.env.STRUCTURED_REVIEW, /steps\.claude_fallback\.outcome == 'success' && steps\.claude_fallback\.outputs\.structured_output/);
+  assert.match(result.run, /\.head_sha == \$sha/);
+  assert.match(result.run, /exit 1/);
+  assert.match(jobs.report.if, /needs\.review\.result == 'success'/);
 });
 
 test('trusted Reporter is the only PR-comment writer and enforces diff inspection', () => {
