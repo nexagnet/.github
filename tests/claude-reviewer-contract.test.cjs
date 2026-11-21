@@ -190,8 +190,8 @@ test('fallback reruns the same read-only Action once behind the typed quota deci
 test('only a successful exact-head result becomes input to the trusted reporter', () => {
   const result = jobs.review.steps.find(step => step.id === 'result');
   assert.equal(jobs.review.outputs.result, '${{ steps.result.outputs.result }}');
-  assert.match(result.env.RESULT, /steps\.claude\.outcome == 'success' && steps\.claude\.outputs\.structured_output/);
-  assert.match(result.env.RESULT, /steps\.claude_fallback\.outcome == 'success' && steps\.claude_fallback\.outputs\.structured_output/);
+  assert.match(result.env.STRUCTURED_REVIEW, /steps\.claude\.outcome == 'success' && steps\.claude\.outputs\.structured_output/);
+  assert.match(result.env.STRUCTURED_REVIEW, /steps\.claude_fallback\.outcome == 'success' && steps\.claude_fallback\.outputs\.structured_output/);
   assert.match(result.run, /\.head_sha == \$sha/);
   assert.match(result.run, /exit 1/);
   assert.match(jobs.report.if, /needs\.review\.result == 'success'/);

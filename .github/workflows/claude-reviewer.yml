@@ -501,16 +501,16 @@ jobs:
         shell: bash
         env:
           SHA: ${{ needs.gate.outputs.head }}
-          RESULT: ${{ steps.claude.outcome == 'success' && steps.claude.outputs.structured_output || steps.claude_fallback.outcome == 'success' && steps.claude_fallback.outputs.structured_output || '' }}
+          STRUCTURED_REVIEW: ${{ steps.claude.outcome == 'success' && steps.claude.outputs.structured_output || steps.claude_fallback.outcome == 'success' && steps.claude_fallback.outputs.structured_output || '' }}
         run: |
           set -euo pipefail
-          if ! result=$(jq -ces --arg sha "$SHA" '
+          if ! normalized_review=$(jq -ces --arg sha "$SHA" '
             select(length == 1) | .[0] | select(type == "object" and .head_sha == $sha)
-          ' <<< "$RESULT" 2>/dev/null) || [[ -z "$result" ]]; then
+          ' <<< "$STRUCTURED_REVIEW" 2>/dev/null) || [[ -z "$normalized_review" ]]; then
             echo '::error::Claude did not produce a successful review result for this PR head.'
             exit 1
           fi
-          printf 'result=%s\n' "$result" >> "$GITHUB_OUTPUT"
+          printf 'result=%s\n' "$normalized_review" >> "$GITHUB_OUTPUT"
 
   report:
     needs: [gate, review]
